@@ -1,0 +1,165 @@
+"""Predictive-coding latent E-step (Algorithm 1) with optional shared-energy dispatch.
+
+References (write-up: distributional_predictive_coding_v2.pdf):
+- Section 4.3 / Algorithm 1 (Section 6.3).
+- Eq. 41: latent sampling z = m + s * xi; we use deterministic moment energies instead.
+- Eq. 43: gradient steps on (m, u) where u = log s^2.
+- Eq. 47-48: schematic local PC gradients.
+- Eq. 49 / Eq. 92: freeze frozen latent statistics via stop_gradient.
+- Eq. 89-90: initialise m by feedforward of mu, init u = log v_init.
+
+References (extension: shared_energy_dbpcn_extension.pdf):
+- Eq. 22-23: E-step descends F_DPC, not the legacy F_z.
+- Eq. 31: full latent update with target and source roles.
+- Eq. 63: kappa-homotopy F_kappa.
+- Eq. 65: proximal latent damping F_E-prox.
+- Algorithm 1 (Section 6.1 of the extension): shared-energy latent E-step.
+
+Assumption I4 (plan): autodiff over (m, u) buffers with the weight pytree
+under stop_gradient. The E-step never updates weights.
+
+The `objective` kwarg selects between:
+- "pc_free_energy" : legacy Eq. 40 free energy. Recovers runs/base/ numerics.
+- "shared_dpc"     : extension Eq. 63 F_kappa shared energy.
+"""
+from typing import NamedTuple, Tuple
+import jax
+import jax.numpy as jnp
+
+from ..models.network import Network
+from ..losses.distributional_kl import gaussian_kl
+from .free_energy import free_energy
+from .shared_energy import shared_free_energy
+from ..utils.safe_math import clamp_u
+
+
+class FrozenLatents(NamedTuple):
+    """Output of the E-step: stop-gradient-ed (mean, variance) of the hidden latent."""
+    m_z: jax.Array     # [B, d_1]
+    v_z: jax.Array     # [B, d_1]
+
+
+class EStepDiagnostics(NamedTuple):
+    F_trace: jax.Array          # [T_z]   per-iteration objective value (mean over batch)
+    F_initial: jax.Array        # scalar  objective at t=0
+    F_final: jax.Array          # scalar  objective after T_z steps
+
+
+def initial_latents(net: Network, x, v_init: float):
+    """m^1 <- feedforward(mu_1 * x);  u^1 <- log v_init  (Eqs. 89, 100)."""
+    hidden = net.layers[0]
+    m = x @ hidden.mu.T                                    # [B, d_1]
+    u = jnp.full(m.shape, jnp.log(v_init))                 # log latent variance
+    return m, u
+
+
+def e_step(
+    net: Network,
+    x: jax.Array,
+    y: jax.Array,
+    *,
+    T_z: int,
+    eta_m: float,
+    eta_u: float,
+    v_init: float,
+    output_weight: float = 1.0,
+    # Shared-energy extension kwargs (defaults preserve legacy behaviour).
+    y_var=None,
+    objective: str = "pc_free_energy",
+    kappa: float = 1.0,
+    rho_z: float = 0.0,
+    gamma_hidden: float = 1.0,
+    gamma_output: float = 1.0,
+) -> Tuple[FrozenLatents, EStepDiagnostics]:
+    """Run T_z latent gradient steps then freeze (Algorithm 1 / extension Alg. 1).
+
+    Weights enter under stop_gradient (assumption I4); no weight gradient flows
+    out of this function.
+
+    Parameters
+    ----------
+    y : [B, C]
+        Output target as a mean vector. For Gaussian-logit targets (I3),
+        this is `y_mean` and the caller should also pass `y_var`.
+    output_weight : float
+        Multiplier on the legacy output likelihood term. 1.0 (default) is
+        Algorithm 1; 0.0 is target-free test-time inference (Section 6.6).
+        Used only when `objective == "pc_free_energy"`.
+    y_var : [B, C] or None
+        Output target variance for Gaussian-logit targets (assumption I3).
+        Required when `objective == "shared_dpc"`. If None, defaults to a
+        zero array (deterministic targets) which is mathematically equivalent
+        to the legacy output term at output_weight=1.
+    objective : str
+        Which scalar to descend:
+        - "pc_free_energy": legacy Eq. 40 free energy (NLL + entropy).
+        - "shared_dpc"    : extension Eq. 63 F_kappa.
+    kappa : float in [0, 1]
+        kappa-homotopy mixing weight for the hidden transition (Eq. 63).
+        Ignored when objective == "pc_free_energy".
+    rho_z : float, >= 0
+        Proximal latent damping coefficient (extension Eq. 65). 0 = off.
+        Anchors the latent posterior to its feedforward initialization
+        (m_init, u_init) for each scan iteration.
+    gamma_hidden, gamma_output : float
+        Per-layer prior-KL coefficients gamma_l. Forwarded to shared energy
+        for include_weight_kl=False (E-step does not need the constant
+        weight-KL term in its scalar; the M-step uses these via m_step).
+    """
+    if objective not in ("pc_free_energy", "shared_dpc"):
+        raise ValueError(f"unknown objective: {objective!r}")
+
+    W = jax.lax.stop_gradient(net)
+    m0, u0 = initial_latents(W, x, v_init)
+
+    if y_var is None:
+        y_var = jnp.zeros_like(y)
+
+    use_prox = float(rho_z) != 0.0
+    # Stop-gradient through prox anchors so they don't flow back into params.
+    m_init = jax.lax.stop_gradient(m0) if use_prox else None
+    u_init = jax.lax.stop_gradient(u0) if use_prox else None
+
+    def F_of_log_var(m, u):
+        v = jnp.exp(u)
+        if objective == "shared_dpc":
+            F = shared_free_energy(
+                W, x, y, y_var, m, v,
+                kappa=kappa,
+                gamma_hidden=gamma_hidden,
+                gamma_output=gamma_output,
+                include_weight_kl=False,
+            )
+        else:  # "pc_free_energy"
+            F = free_energy(W, x, y, m, v, output_weight=output_weight)
+        if use_prox:
+            # Proximal latent damping (extension Eq. 65). Anchored at the
+            # feedforward initial (m_init, u_init).
+            v_init_anchor = jnp.exp(u_init)
+            prox = gaussian_kl(m_z=m, v_z=v, m_p=m_init, v_p=v_init_anchor).kl.sum(axis=-1).mean()
+            F = F + float(rho_z) * prox
+        return F
+
+    grad_fn = jax.grad(F_of_log_var, argnums=(0, 1))
+
+    def step(carry, _):
+        m, u = carry
+        gm, gu = grad_fn(m, u)
+        m_new = m - eta_m * gm                              # Eq. 43 / extension Eq. 57
+        u_new = clamp_u(u - eta_u * gu)                     # Eq. 43 + Algorithm 1 step 4e
+        F_new = F_of_log_var(m_new, u_new)
+        return (m_new, u_new), F_new
+
+    (m_final, u_final), F_trace = jax.lax.scan(step, (m0, u0), None, length=T_z)
+    F_initial = F_of_log_var(m0, u0)
+
+    # Freeze (Eq. 49 / Eq. 92): stop_gradient + record final statistics.
+    m_z = jax.lax.stop_gradient(m_final)
+    v_z = jax.lax.stop_gradient(jnp.exp(u_final))
+
+    diagnostics = EStepDiagnostics(
+        F_trace=F_trace,
+        F_initial=F_initial,
+        F_final=F_trace[-1],
+    )
+    return FrozenLatents(m_z=m_z, v_z=v_z), diagnostics
