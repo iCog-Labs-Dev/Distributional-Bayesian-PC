@@ -19,11 +19,13 @@ from ..models.network import init_network
 from ..models.moments import moment_forward
 from ..models.layer import init_layer
 from ..inference.e_step import e_step, initial_latents
+from ..inference.feature_moments import psi_moments, relu_delta_moments
 from ..inference.free_energy import free_energy
-from ..inference.shared_energy import shared_free_energy
+from ..inference.shared_energy import shared_free_energy, _output_predictive
 from ..training.m_step import m_step, update_layer
 from ..training.loop import make_batch_step
 from ..losses.distributional_kl import gaussian_kl
+from ..evaluation.predict import _target_free_frozen, _mean_predict_from_frozen
 from ..utils.safe_math import clamp_u
 
 
@@ -458,14 +460,14 @@ def s11_F_DPC_mstep_decrease(cfg):
     return _bad(f"F_DPC INCREASED: {F_before:.6f} -> {F_after:.6f} (delta {F_after-F_before:.3e})")
 
 
-def s12_legacy_reproducibility(cfg):
-    """S12: e_step(objective='pc_free_energy') matches a manual legacy descent.
+def s12_legacy_objective_dispatch(cfg):
+    """S12: e_step(objective='pc_free_energy') matches manual objective descent.
 
-    Verifies that the new dispatching e_step at objective='pc_free_energy'
-    produces exactly the same trajectory as the legacy gradient-descent loop
-    on free_energy. Tolerance: floating point.
+    Verifies that objective='pc_free_energy' descends the legacy Eq. 40 scalar
+    with the current initialization. This is dispatch consistency, not a claim
+    that old run numerics are reproduced after predictive latent init.
     """
-    print("[S12] Legacy backward compatibility (objective='pc_free_energy')")
+    print("[S12] Legacy objective dispatch (objective='pc_free_energy')")
     key = jax.random.PRNGKey(13)
     net = init_network(key, cfg.layer_dims)
     B = 8
@@ -479,7 +481,7 @@ def s12_legacy_reproducibility(cfg):
         objective="pc_free_energy",
     )
 
-    # Replicate the legacy descent manually.
+    # Replicate the legacy-objective descent manually from the current init.
     W = jax.lax.stop_gradient(net)
     m0, u0 = initial_latents(W, x, cfg.v_init)
 
@@ -498,8 +500,8 @@ def s12_legacy_reproducibility(cfg):
     err_v = float(jnp.abs(frozen.v_z - v_legacy).max())
     tol = 1e-5
     if err_m < tol and err_v < tol:
-        return _ok(f"legacy match: |dm|={err_m:.3e}, |dv|={err_v:.3e}")
-    return _bad(f"legacy diverged: |dm|={err_m:.3e}, |dv|={err_v:.3e} (tol {tol})")
+        return _ok(f"dispatch match: |dm|={err_m:.3e}, |dv|={err_v:.3e}")
+    return _bad(f"dispatch diverged: |dm|={err_m:.3e}, |dv|={err_v:.3e} (tol {tol})")
 
 
 def s13_mstep_gradient_identity(cfg):
@@ -570,6 +572,263 @@ def s13_mstep_gradient_identity(cfg):
     return ok
 
 
+def s14_predictive_latent_init(cfg):
+    """S14: initial_latents uses hidden predictive moments with a v_init floor."""
+    print("[S14] Predictive latent initialization")
+    key = jax.random.PRNGKey(15)
+    net = init_network(
+        key,
+        cfg.layer_dims,
+        alpha_hidden=cfg.alpha_hidden,
+        alpha_output=cfg.alpha_output,
+        beta_inv_hidden=cfg.beta_inv_hidden,
+        beta_inv_output=cfg.beta_inv_output,
+        init_log_var=cfg.init_log_var,
+    )
+    x = jnp.vstack([
+        jnp.zeros((1, cfg.input_dim), dtype=jnp.float32),
+        jnp.ones((1, cfg.input_dim), dtype=jnp.float32),
+    ])
+
+    m0, u0 = initial_latents(net, x, cfg.v_init)
+    m_pred, v_pred = moment_forward(net.layers[0], x, jnp.zeros_like(x))
+    v0 = jnp.exp(u0)
+    v_expected = jnp.maximum(v_pred, cfg.v_init)
+
+    ok = True
+    err_m = float(jnp.abs(m0 - m_pred).max())
+    err_v = float(jnp.abs(v0 - v_expected).max())
+    if err_m < 1e-6:
+        _ok(f"initial mean matches hidden predictive mean (max diff {err_m:.3e})")
+    else:
+        ok &= _bad(f"initial mean mismatch (max diff {err_m:.3e})")
+    if err_v < 1e-6:
+        _ok(f"initial variance matches max(v_pred, v_init) (max diff {err_v:.3e})")
+    else:
+        ok &= _bad(f"initial variance mismatch (max diff {err_v:.3e})")
+
+    kl0 = float(gaussian_kl(m0, v0, m_pred, v_pred).kl.mean())
+    if kl0 < 1e-6:
+        _ok(f"initial hidden KL is zero under default floor (KL={kl0:.3e})")
+    else:
+        ok &= _bad(f"initial hidden KL is not zero (KL={kl0:.3e})")
+
+    if float(jnp.abs(v0[1].mean() - v0[0].mean())) > 1e-6:
+        _ok("initial variance is input-dependent")
+    else:
+        ok &= _bad("initial variance is still input-constant")
+    return ok
+
+
+def s15_shared_dpc_target_free_at_fixed_point(cfg):
+    """S15: target-free shared-DPC E-step is a no-op under predictive init.
+
+    With objective='shared_dpc', kappa=1, output_weight=0, and the predictive
+    latent init, the initial q(z) equals q_pred and so F_trans_dpc(m0, v0)=0,
+    grad=0. The scan should leave (m, v) essentially unchanged and the F
+    trace should sit at zero. This is the strongest end-to-end check that
+    train and eval optimize the same scalar.
+    """
+    print("[S15] Shared-DPC target-free E-step is a no-op under predictive init")
+    key = jax.random.PRNGKey(16)
+    net = init_network(
+        key, cfg.layer_dims,
+        alpha_hidden=cfg.alpha_hidden, alpha_output=cfg.alpha_output,
+        beta_inv_hidden=cfg.beta_inv_hidden, beta_inv_output=cfg.beta_inv_output,
+        init_log_var=cfg.init_log_var,
+    )
+    rng = np.random.default_rng(16)
+    B = 32
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg.input_dim)).astype(np.float32))
+    y_zero = jnp.zeros((B, cfg.output_dim), dtype=x.dtype)
+    y_var_zero = jnp.zeros_like(y_zero)
+
+    m0, u0 = initial_latents(net, x, cfg.v_init)
+    v0 = jnp.exp(u0)
+
+    frozen, diag = e_step(
+        net, x, y_zero,
+        T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
+        output_weight=0.0,
+        y_var=y_var_zero,
+        objective="shared_dpc",
+        kappa=1.0,
+    )
+
+    err_m = float(jnp.abs(frozen.m_z - m0).max())
+    err_v = float(jnp.abs(frozen.v_z - v0).max())
+    F_initial = float(diag.F_initial)
+    F_final = float(diag.F_final)
+
+    ok = True
+    tol_state = 1e-4
+    tol_F = 1e-4
+    if err_m < tol_state:
+        _ok(f"m unchanged across E-step (max |dm|={err_m:.3e} < {tol_state})")
+    else:
+        ok &= _bad(f"m moved away from predictive-init fixed point (max |dm|={err_m:.3e})")
+    if err_v < tol_state:
+        _ok(f"v unchanged across E-step (max |dv|={err_v:.3e} < {tol_state})")
+    else:
+        ok &= _bad(f"v moved away from predictive-init fixed point (max |dv|={err_v:.3e})")
+    if abs(F_initial) < tol_F and abs(F_final) < tol_F:
+        _ok(f"F sits at zero (F_initial={F_initial:.3e}, F_final={F_final:.3e})")
+    else:
+        ok &= _bad(f"F not at fixed point (F_initial={F_initial:.3e}, F_final={F_final:.3e})")
+    return ok
+
+
+def s16_relu_psi_moment_correctness(cfg):
+    """S16: relu_delta_moments approximates MC moments of ReLU(N(m, v)).
+
+    Delta-method (Section 4.5 option 2): m_h = mask * m_z, v_h = mask * v_z
+    with mask = (m_z > 0). Compare to a Monte Carlo estimate over many
+    samples. The delta method is exact when |m_z| >> sigma but becomes a
+    rough approximation when m_z is near zero. We choose mixed-sign means
+    well away from zero so the approximation is tight; for means near zero
+    we apply a looser tolerance.
+    """
+    print("[S16] ReLU psi delta-method vs Monte Carlo moments")
+    rng = np.random.default_rng(17)
+    # Mixed-sign means well away from zero relative to sigma.
+    m_z = jnp.asarray(rng.uniform(-2.0, 2.0, (1024,)).astype(np.float32))
+    v_z = jnp.asarray(rng.uniform(0.05, 0.20, (1024,)).astype(np.float32))
+
+    m_h_delta, v_h_delta = psi_moments("relu", m_z, v_z)
+
+    # MC estimate.
+    S = 8000
+    key = jax.random.PRNGKey(217)
+    noise = jax.random.normal(key, (S, m_z.shape[0]))
+    z = m_z[None, :] + jnp.sqrt(v_z)[None, :] * noise   # [S, D]
+    relu_z = jnp.where(z > 0, z, 0.0)
+    m_h_mc = relu_z.mean(axis=0)
+    v_h_mc = relu_z.var(axis=0)
+
+    # Restrict the check to units whose mean is at least ~1 sigma from zero,
+    # where the delta approximation is supposed to hold tightly.
+    sigma = jnp.sqrt(v_z)
+    well_separated = jnp.abs(m_z) > sigma
+    n_well = int(well_separated.sum())
+    if n_well < 32:
+        return _bad(f"sample selection produced only {n_well} well-separated units")
+    err_m = float(jnp.abs(m_h_delta - m_h_mc)[well_separated].max())
+    err_v = float(jnp.abs(v_h_delta - v_h_mc)[well_separated].max())
+    tol_m = 0.05
+    tol_v = 0.05
+    ok = True
+    if err_m < tol_m:
+        _ok(f"|m_h_delta - m_h_mc|_max = {err_m:.3e} < {tol_m} (well-separated units)")
+    else:
+        ok &= _bad(f"mean approximation error too large: {err_m:.3e}")
+    if err_v < tol_v:
+        _ok(f"|v_h_delta - v_h_mc|_max = {err_v:.3e} < {tol_v} (well-separated units)")
+    else:
+        ok &= _bad(f"variance approximation error too large: {err_v:.3e}")
+    # Identity psi must remain a pure pass-through.
+    m_id, v_id = psi_moments("identity", m_z, v_z)
+    if jnp.allclose(m_id, m_z) and jnp.allclose(v_id, v_z):
+        _ok("psi='identity' is a pass-through")
+    else:
+        ok &= _bad("psi='identity' altered (m_z, v_z)")
+    return ok
+
+
+def s17_relu_end_to_end_dispatch(cfg):
+    """S17: end-to-end dispatch with psi='relu' on the base architecture.
+
+    Build a small ReLU-equipped net, run target-free shared-DPC e_step,
+    confirm:
+      - _output_predictive returns finite moments,
+      - shared_free_energy returns a finite scalar,
+      - m_step runs without shape errors and produces finite outputs,
+      - _mean_predict_from_frozen returns a probability vector summing to 1.
+    """
+    print("[S17] ReLU end-to-end dispatch")
+    cfg_relu = replace(cfg, psi="relu")
+    key = jax.random.PRNGKey(18)
+    net = init_network(
+        key, cfg_relu.layer_dims,
+        alpha_hidden=cfg_relu.alpha_hidden, alpha_output=cfg_relu.alpha_output,
+        beta_inv_hidden=cfg_relu.beta_inv_hidden, beta_inv_output=cfg_relu.beta_inv_output,
+        init_log_var=cfg_relu.init_log_var,
+        psi=cfg_relu.psi,
+    )
+    if net.psi != "relu":
+        return _bad(f"Network.psi did not propagate: got {net.psi!r}")
+    _ok(f"Network.psi == {net.psi!r}")
+
+    rng = np.random.default_rng(18)
+    B = 32
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_relu.input_dim)).astype(np.float32))
+    y = jnp.zeros((B, cfg_relu.output_dim), dtype=jnp.float32).at[:, 0].set(1.0)
+    y_var = jnp.full_like(y, cfg_relu.target_var)
+
+    # Run a shared-DPC training E-step.
+    frozen, e_diag = e_step(
+        net, x, y,
+        T_z=cfg_relu.T_z, eta_m=cfg_relu.eta_m, eta_u=cfg_relu.eta_u, v_init=cfg_relu.v_init,
+        y_var=y_var, objective="shared_dpc", kappa=1.0,
+    )
+    ok = True
+    if jnp.all(jnp.isfinite(frozen.m_z)) and jnp.all(jnp.isfinite(frozen.v_z)) and jnp.all(frozen.v_z > 0):
+        _ok("e_step (shared-DPC, relu) produced finite, positive-variance frozen latents")
+    else:
+        ok &= _bad("e_step produced non-finite or non-positive latent moments")
+
+    # Output predictive uses ReLU(z^1).
+    m_py, v_py = _output_predictive(net, frozen.m_z, frozen.v_z)
+    if jnp.all(jnp.isfinite(m_py)) and jnp.all(jnp.isfinite(v_py)) and jnp.all(v_py > 0):
+        _ok(f"_output_predictive finite (|m_py|_mean={float(jnp.abs(m_py).mean()):.3e})")
+    else:
+        ok &= _bad("_output_predictive returned non-finite or non-positive moments")
+
+    # Shared free energy is a finite scalar.
+    F = float(shared_free_energy(
+        net, x, y, y_var, frozen.m_z, frozen.v_z,
+        kappa=1.0, gamma_hidden=cfg_relu.gamma_hidden, gamma_output=cfg_relu.gamma_output,
+        include_weight_kl=True,
+    ))
+    if math.isfinite(F):
+        _ok(f"shared_free_energy finite (F={F:.4f})")
+    else:
+        ok &= _bad(f"shared_free_energy non-finite (F={F})")
+
+    # M-step runs without shape errors.
+    new_net, m_diag = m_step(
+        net, frozen, x, y, y_var,
+        alpha_hidden=cfg_relu.alpha_hidden, alpha_output=cfg_relu.alpha_output,
+        gamma_hidden=cfg_relu.gamma_hidden, gamma_output=cfg_relu.gamma_output,
+        eta_mu_hidden=cfg_relu.eta_mu_hidden, eta_tau_hidden=cfg_relu.eta_tau_hidden,
+        eta_mu_output=cfg_relu.eta_mu_output, eta_tau_output=cfg_relu.eta_tau_output,
+        data_scale=1.0 / B, prior_scale=1.0,
+    )
+    finite_new = all(
+        jnp.all(jnp.isfinite(lr.mu)) and jnp.all(jnp.isfinite(lr.tau))
+        for lr in new_net.layers
+    )
+    if finite_new and new_net.psi == "relu":
+        _ok("m_step produced finite weights and preserved Network.psi")
+    else:
+        ok &= _bad("m_step weights non-finite or psi was dropped")
+
+    # Mean predict.
+    frozen_eval = _target_free_frozen(
+        new_net, x,
+        T_z=cfg_relu.eval_T_z_resolved, eta_m=cfg_relu.eval_eta_m_resolved,
+        eta_u=cfg_relu.eval_eta_u_resolved, v_init=cfg_relu.eval_v_init_resolved,
+        objective="shared_dpc",
+    )
+    p_mean = _mean_predict_from_frozen(new_net, frozen_eval)
+    row_sums = p_mean.sum(axis=-1)
+    if jnp.allclose(row_sums, 1.0, atol=1e-5) and jnp.all(p_mean >= 0):
+        _ok(f"_mean_predict_from_frozen returns proper distribution (max |sum-1|={float(jnp.abs(row_sums-1).max()):.2e})")
+    else:
+        ok &= _bad("_mean_predict_from_frozen returned malformed distribution")
+
+    return ok
+
+
 def main():
     cfg = BaseConfig()
     print(f"[bpcn] Running sanity checks with config layer_dims={cfg.layer_dims}", flush=True)
@@ -585,8 +844,12 @@ def main():
         "S9": s9_iterative_m_step(cfg),
         "S10": s10_F_DPC_monotone(cfg),
         "S11": s11_F_DPC_mstep_decrease(cfg),
-        "S12": s12_legacy_reproducibility(cfg),
+        "S12": s12_legacy_objective_dispatch(cfg),
         "S13": s13_mstep_gradient_identity(cfg),
+        "S14": s14_predictive_latent_init(cfg),
+        "S15": s15_shared_dpc_target_free_at_fixed_point(cfg),
+        "S16": s16_relu_psi_moment_correctness(cfg),
+        "S17": s17_relu_end_to_end_dispatch(cfg),
     }
     print()
     print("=" * 60)

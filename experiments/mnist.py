@@ -34,6 +34,7 @@ from bpcn.data.mnist import count_batches, iter_minibatches, load_split
 from bpcn.evaluation.diagnostics import EpochDiagnostics, variance_decomposition
 from bpcn.evaluation.predict import evaluate_split
 from bpcn.inference.e_step import e_step
+from bpcn.inference.feature_moments import psi_moments
 from bpcn.models.network import init_network
 from bpcn.training.loop import make_batch_step
 
@@ -55,6 +56,14 @@ def _positive_int(s: str) -> int:
     v = int(s)
     if v < 1:
         raise argparse.ArgumentTypeError("value must be >= 1")
+    return v
+
+
+def _nonnegative_int(s: str) -> int:
+    """Argparse type for counts that must be zero or positive."""
+    v = int(s)
+    if v < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
     return v
 
 
@@ -103,6 +112,11 @@ def parse_args(argv=None):
     g_net.add_argument(
         "--init-log-var", type=float, default=None,
         help="Initial tau = log sigma_0^2 (Eq. 99, Section 8.1).")
+    g_net.add_argument(
+        "--psi", type=str, default=None, choices=["identity", "relu"],
+        help="Feature map between hidden latent z^1 and the output layer's "
+             "presynaptic input (Section 4.5). 'identity' = linear base; "
+             "'relu' = delta-method ReLU moment propagation.")
 
     g_prior = p.add_argument_group("priors and residual variance (A4, A9; Eqs. 24, 27)")
     g_prior.add_argument(
@@ -130,7 +144,7 @@ def parse_args(argv=None):
         help="Latent log-variance learning rate (Eq. 43).")
     g_e.add_argument(
         "--v-init", type=float, default=None,
-        help="Initial latent variance v_init (Eq. 100).")
+        help="Minimum latent variance floor used by predictive latent initialization.")
 
     g_m = p.add_argument_group("M-step (Algorithm 2; Eqs. 81-82)")
     g_m.add_argument(
@@ -162,6 +176,10 @@ def parse_args(argv=None):
     g_t.add_argument(
         "--target-var", type=float, default=None,
         help="Gaussian-logit target variance epsilon_y (Section 8.2 Option 2).")
+    g_t.add_argument(
+        "--target-scale", type=_positive_float, default=None,
+        help="One-hot peak magnitude in logit space (default 1.0). Raise (e.g. 5) "
+             "to lower the softmax confidence ceiling and the NLL/entropy floor.")
 
     g_se = p.add_argument_group("shared-energy extension (M-SE; shared_energy_dbpcn_extension.pdf)")
     g_se.add_argument(
@@ -219,7 +237,10 @@ def parse_args(argv=None):
         help="Target-free test-time latent log-variance learning rate; defaults to --eta-u.")
     g_train.add_argument(
         "--eval-v-init", type=_positive_float, default=None,
-        help="Target-free test-time initial latent variance; defaults to --v-init.")
+        help="Target-free test-time latent variance floor; defaults to --v-init.")
+    g_train.add_argument(
+        "--eval-objective", type=str, default=None, choices=["pc_free_energy", "shared_dpc"],
+        help="Target-free eval E-step objective. Defaults to matching --objective.")
     g_train.add_argument(
         "--no-eval", action="store_true",
         help="Skip MC eval each epoch (faster smoke runs).")
@@ -228,6 +249,14 @@ def parse_args(argv=None):
     g_out.add_argument(
         "--run-dir", type=str, default=None,
         help="Directory for config.json / history.json / weights.npz artefacts.")
+    g_out.add_argument(
+        "--checkpoint-every", type=_nonnegative_int, default=1,
+        help="Save config/history/weights every K epochs during training. "
+             "0 disables intermediate checkpoints.")
+    g_out.add_argument(
+        "--resume-from", type=str, default=None,
+        help="Run directory containing config.json / history.json / weights.npz "
+             "to resume from. CLI hyperparameters still come from this command.")
 
     return p.parse_args(argv)
 
@@ -241,17 +270,18 @@ def parse_args(argv=None):
 _CFG_FIELDS = (
     "classes", "batch_size",
     "input_dim", "hidden_dim", "hidden_init", "output_init", "init_log_var",
+    "psi",
     "alpha_hidden", "alpha_output", "beta_inv_hidden", "beta_inv_output",
     "T_z", "eta_m", "eta_u", "v_init",
     "eta_mu_hidden", "eta_tau_hidden", "eta_mu_output", "eta_tau_output",
     "gamma_hidden", "gamma_output", "gamma_warmup_epochs", "m_step_iters",
-    "target_var",
+    "target_var", "target_scale",
     # M-SE shared-energy extension fields.
     "objective", "kappa_start", "kappa_warmup_epochs",
     "rho_z", "rho_w", "r_max",
     "accept_or_damp", "accept_damp_omega", "accept_damp_tol",
     "epochs", "eval_every", "seed", "mc_samples",
-    "eval_T_z", "eval_eta_m", "eval_eta_u", "eval_v_init",
+    "eval_T_z", "eval_eta_m", "eval_eta_u", "eval_v_init", "eval_objective",
     "run_dir",
 )
 
@@ -288,6 +318,9 @@ def run(
     n_train_load: int = 60000,
     n_test_load: int = 10000,
     run_eval: bool = True,
+    initial_net=None,
+    initial_history=None,
+    epoch_callback=None,
     log_fn=print,
 ) -> dict:
     """Pure-function training driver.
@@ -296,6 +329,9 @@ def run(
       - history: JSON-serialisable per-epoch list (matches runs/base/history.json layout).
       - net    : final Network pytree.
     """
+    initial_history = [] if initial_history is None else list(initial_history)
+    start_epoch = len(initial_history) + 1
+
     log_fn(f"[bpcn.mnist] Loading MNIST classes {cfg.classes} ...")
     train = load_split(cfg.classes, train=True, seed=cfg.seed,
                        n_train=n_train_load, n_test=n_test_load)
@@ -307,22 +343,36 @@ def run(
     log_fn(f"[bpcn.mnist] Initializing network {cfg.layer_dims} ...")
     key = jax.random.PRNGKey(cfg.seed)
     key, init_key = jax.random.split(key)
-    net = init_network(
-        init_key,
-        layer_dims=cfg.layer_dims,
-        alpha_hidden=cfg.alpha_hidden,
-        alpha_output=cfg.alpha_output,
-        beta_inv_hidden=cfg.beta_inv_hidden,
-        beta_inv_output=cfg.beta_inv_output,
-        init_log_var=cfg.init_log_var,
-        hidden_init=cfg.hidden_init,
-        output_init=cfg.output_init,
-    )
+    if initial_net is None:
+        net = init_network(
+            init_key,
+            layer_dims=cfg.layer_dims,
+            alpha_hidden=cfg.alpha_hidden,
+            alpha_output=cfg.alpha_output,
+            beta_inv_hidden=cfg.beta_inv_hidden,
+            beta_inv_output=cfg.beta_inv_output,
+            init_log_var=cfg.init_log_var,
+            hidden_init=cfg.hidden_init,
+            output_init=cfg.output_init,
+            psi=cfg.psi,
+        )
+    else:
+        net = initial_net
+        log_fn(
+            f"[bpcn.mnist] Resuming from checkpoint after "
+            f"{len(initial_history)} completed epoch(s)."
+        )
+
+    # Keep eval RNG deterministic when resuming from a saved history. This
+    # mirrors the key splits that completed epochs would have consumed.
+    for past_epoch in range(1, start_epoch):
+        if run_eval and (past_epoch % cfg.eval_every == 0 or past_epoch == cfg.epochs):
+            key, _ = jax.random.split(key)
 
     batch_step = make_batch_step(cfg, N_train=N_train)
-    history = []
+    history = initial_history
 
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch, cfg.epochs + 1):
         ep_diag = EpochDiagnostics()
         t0 = time.time()
         n_batches = count_batches(train, cfg.batch_size, drop_last=True)
@@ -332,6 +382,7 @@ def run(
             batch_size=cfg.batch_size,
             n_classes=cfg.output_dim,
             target_var=cfg.target_var,
+            target_scale=cfg.target_scale,
             shuffle_seed=cfg.seed + epoch,
         )):
             net, e_diag, m_diag, f_dpc = batch_step(
@@ -364,9 +415,13 @@ def run(
         if run_eval and (epoch % cfg.eval_every == 0 or epoch == cfg.epochs):
             key, ek = jax.random.split(key)
             metrics = evaluate_split(net, test, cfg, ek, batch_size=256)
-            # Variance decomposition uses the target-free test-time E-step (Section 6.6).
+            # Variance decomposition uses the target-free test-time E-step
+            # under the configured eval objective so the diagnostic is at the
+            # same fixed point evaluate_split uses. y_var stays zero because
+            # output_weight=0 disables K_out in both objectives.
             xb = jnp.asarray(test.x[:256])
             yb = jnp.zeros((256, cfg.output_dim), dtype=xb.dtype)
+            yvb = jnp.zeros_like(yb)
             frozen, _ = e_step(
                 net, xb, yb,
                 T_z=cfg.eval_T_z_resolved,
@@ -374,12 +429,24 @@ def run(
                 eta_u=cfg.eval_eta_u_resolved,
                 v_init=cfg.eval_v_init_resolved,
                 output_weight=0.0,
+                y_var=yvb,
+                objective=cfg.eval_objective_resolved,
+                kappa=1.0,
+                gamma_hidden=cfg.gamma_hidden,
+                gamma_output=cfg.gamma_output,
             )
-            vd = variance_decomposition(net, frozen.m_z, frozen.v_z, layer_idx=-1)
+            # Variance decomposition of the OUTPUT layer's predictive uses
+            # the post-psi presynaptic moments (Section 4.5).
+            m_h_vd, v_h_vd = psi_moments(cfg.psi, frozen.m_z, frozen.v_z)
+            vd = variance_decomposition(net, m_h_vd, v_h_vd, layer_idx=-1)
             log_fn(
-                f"[bpcn.mnist] epoch {epoch} eval: acc={metrics['accuracy']:.4f} "
+                f"[bpcn.mnist] epoch {epoch} eval: "
+                f"MC[acc={metrics['accuracy']:.4f} "
                 f"NLL={-metrics['log_likelihood_mean']:.4f} "
-                f"H_mean={metrics['entropy_mean']:.4f}"
+                f"H={metrics['entropy_mean']:.4f}]  "
+                f"MEAN[acc={metrics['mean_accuracy']:.4f} "
+                f"NLL={-metrics['mean_log_likelihood_mean']:.4f} "
+                f"H={metrics['mean_entropy_mean']:.4f}]"
             )
             log_fn(
                 f"[bpcn.mnist] epoch {epoch} variance decomposition (output layer): "
@@ -391,6 +458,8 @@ def run(
             epoch_record["var_decomp"] = vd
 
         history.append(epoch_record)
+        if epoch_callback is not None:
+            epoch_callback(epoch, history, net)
 
     return {"history": history, "net": net}
 
@@ -399,6 +468,33 @@ def run(
 # Artefacts
 # ---------------------------------------------------------------------------
 
+def _atomic_json_dump(path: str, obj) -> None:
+    """Write JSON via os.replace so interrupted checkpoints keep prior files."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _weights_dict(net) -> dict:
+    weights = {}
+    for li, layer in enumerate(net.layers):
+        weights[f"layer_{li}_mu"] = np.asarray(layer.mu)
+        weights[f"layer_{li}_tau"] = np.asarray(layer.tau)
+    return weights
+
+
+def _save_weights_npz(path: str, net) -> None:
+    tmp_path = f"{path}.tmp.npz"
+    np.savez(tmp_path, **_weights_dict(net))
+    os.replace(tmp_path, path)
+
+
+def _config_json(cfg: BaseConfig) -> dict:
+    return {k: list(v) if isinstance(v, tuple) else v
+            for k, v in dataclasses.asdict(cfg).items()}
+
+
 def save_artifacts(cfg: BaseConfig, result: dict) -> str:
     """Write config.json, history.json, weights.npz to cfg.run_dir.
 
@@ -406,22 +502,50 @@ def save_artifacts(cfg: BaseConfig, result: dict) -> str:
     """
     os.makedirs(cfg.run_dir, exist_ok=True)
 
-    cfg_json = {k: list(v) if isinstance(v, tuple) else v
-                for k, v in dataclasses.asdict(cfg).items()}
-    with open(os.path.join(cfg.run_dir, "config.json"), "w") as f:
-        json.dump(cfg_json, f, indent=2)
-
-    with open(os.path.join(cfg.run_dir, "history.json"), "w") as f:
-        json.dump(result["history"], f, indent=2)
-
-    net = result["net"]
-    weights = {}
-    for li, layer in enumerate(net.layers):
-        weights[f"layer_{li}_mu"] = np.asarray(layer.mu)
-        weights[f"layer_{li}_tau"] = np.asarray(layer.tau)
-    np.savez(os.path.join(cfg.run_dir, "weights.npz"), **weights)
+    _atomic_json_dump(os.path.join(cfg.run_dir, "config.json"), _config_json(cfg))
+    _atomic_json_dump(os.path.join(cfg.run_dir, "history.json"), result["history"])
+    _save_weights_npz(os.path.join(cfg.run_dir, "weights.npz"), result["net"])
 
     return cfg.run_dir
+
+
+def _load_checkpoint(cfg: BaseConfig, checkpoint_dir: str):
+    """Load history and weights from a previous run directory."""
+    history_path = os.path.join(checkpoint_dir, "history.json")
+    weights_path = os.path.join(checkpoint_dir, "weights.npz")
+    with open(history_path) as f:
+        history = json.load(f)
+
+    net = init_network(
+        jax.random.PRNGKey(cfg.seed),
+        layer_dims=cfg.layer_dims,
+        alpha_hidden=cfg.alpha_hidden,
+        alpha_output=cfg.alpha_output,
+        beta_inv_hidden=cfg.beta_inv_hidden,
+        beta_inv_output=cfg.beta_inv_output,
+        init_log_var=cfg.init_log_var,
+        hidden_init=cfg.hidden_init,
+        output_init=cfg.output_init,
+        psi=cfg.psi,
+    )
+
+    weights = np.load(weights_path)
+    layers = []
+    for li, layer in enumerate(net.layers):
+        mu_key = f"layer_{li}_mu"
+        tau_key = f"layer_{li}_tau"
+        if mu_key not in weights or tau_key not in weights:
+            raise ValueError(f"checkpoint is missing {mu_key}/{tau_key}")
+        mu = jnp.asarray(weights[mu_key])
+        tau = jnp.asarray(weights[tau_key])
+        if mu.shape != layer.mu.shape or tau.shape != layer.tau.shape:
+            raise ValueError(
+                f"checkpoint layer {li} has shape mu={mu.shape}, tau={tau.shape}; "
+                f"expected mu={layer.mu.shape}, tau={layer.tau.shape}"
+            )
+        layers.append(layer._replace(mu=mu, tau=tau))
+    weights.close()
+    return history, net._replace(layers=tuple(layers))
 
 
 # ---------------------------------------------------------------------------
@@ -431,11 +555,29 @@ def save_artifacts(cfg: BaseConfig, result: dict) -> str:
 def main(argv=None):
     args = parse_args(argv)
     cfg = build_config(args)
+    initial_history = None
+    initial_net = None
+    if args.resume_from is not None:
+        initial_history, initial_net = _load_checkpoint(cfg, args.resume_from)
+
+    checkpoint_every = int(args.checkpoint_every)
+
+    def checkpoint(epoch, history, net):
+        if checkpoint_every == 0:
+            return
+        if epoch % checkpoint_every != 0 and epoch != cfg.epochs:
+            return
+        save_artifacts(cfg, {"history": history, "net": net})
+        print(f"[bpcn.mnist] checkpoint saved at epoch {epoch} in {cfg.run_dir}")
+
     result = run(
         cfg,
         n_train_load=args.n_train,
         n_test_load=args.n_test,
         run_eval=not args.no_eval,
+        initial_net=initial_net,
+        initial_history=initial_history,
+        epoch_callback=checkpoint,
     )
     out = save_artifacts(cfg, result)
     print(f"[bpcn.mnist] DONE. Artefacts in {out}")
@@ -443,4 +585,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    print(f"Starting Distributional Bayesian Predictive Coding experiment on: {jax.default_backend()}")
     sys.exit(main())

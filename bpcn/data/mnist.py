@@ -73,10 +73,15 @@ def iter_minibatches(
     batch_size: int,
     n_classes: int,
     target_var: float,
+    target_scale: float = 1.0,
     drop_last: bool = True,
     shuffle_seed: int = None,
 ) -> Iterator[Batch]:
-    """Yield batches with Gaussian-logit one-hot targets (assumption I3)."""
+    """Yield batches with Gaussian-logit one-hot targets (assumption I3).
+
+    `target_scale` sets the one-hot peak magnitude (see
+    `gaussian_logit_target`); default 1.0 preserves the original encoding.
+    """
     N = len(split.x)
     indices = np.arange(N)
     if shuffle_seed is not None:
@@ -88,7 +93,7 @@ def iter_minibatches(
         sl = indices[i * batch_size:(i + 1) * batch_size]
         x = split.x[sl]
         y_idx = split.y_idx[sl]
-        y_mean, y_var = gaussian_logit_target(y_idx, n_classes, target_var)
+        y_mean, y_var = gaussian_logit_target(y_idx, n_classes, target_var, target_scale)
         yield Batch(x=x, y_idx=y_idx, y_mean=y_mean, y_var=y_var)
 
 
