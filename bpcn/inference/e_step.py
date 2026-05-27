@@ -6,7 +6,9 @@ References (write-up: distributional_predictive_coding_v2.pdf):
 - Eq. 43: gradient steps on (m, u) where u = log s^2.
 - Eq. 47-48: schematic local PC gradients.
 - Eq. 49 / Eq. 92: freeze frozen latent statistics via stop_gradient.
-- Eq. 89-90: initialise m by feedforward of mu, init u = log v_init.
+- Eq. 89: initialise m by feedforward of mu.
+- Predictive-init extension: initialise u from the moment-matched local
+  Bayesian prior variance, floored by v_init.
 
 References (extension: shared_energy_dbpcn_extension.pdf):
 - Eq. 22-23: E-step descends F_DPC, not the legacy F_z.
@@ -19,7 +21,7 @@ Assumption I4 (plan): autodiff over (m, u) buffers with the weight pytree
 under stop_gradient. The E-step never updates weights.
 
 The `objective` kwarg selects between:
-- "pc_free_energy" : legacy Eq. 40 free energy. Recovers runs/base/ numerics.
+- "pc_free_energy" : legacy Eq. 40 free energy.
 - "shared_dpc"     : extension Eq. 63 F_kappa shared energy.
 """
 from typing import NamedTuple, Tuple
@@ -27,6 +29,7 @@ import jax
 import jax.numpy as jnp
 
 from ..models.network import Network
+from ..models.moments import moment_forward
 from ..losses.distributional_kl import gaussian_kl
 from .free_energy import free_energy
 from .shared_energy import shared_free_energy
@@ -46,10 +49,17 @@ class EStepDiagnostics(NamedTuple):
 
 
 def initial_latents(net: Network, x, v_init: float):
-    """m^1 <- feedforward(mu_1 * x);  u^1 <- log v_init  (Eqs. 89, 100)."""
+    """Initialize q(z^1) from the hidden layer predictive prior.
+
+    m^1 is still the posterior-mean feedforward prediction (Eq. 89). The
+    variance now uses the moment-matched predictive variance from Eqs. 60-61,
+    with v_init retained as a numerical floor rather than the actual constant
+    initialization.
+    """
     hidden = net.layers[0]
-    m = x @ hidden.mu.T                                    # [B, d_1]
-    u = jnp.full(m.shape, jnp.log(v_init))                 # log latent variance
+    m, v_pred = moment_forward(hidden, x, jnp.zeros_like(x))  # [B, d_1]
+    v_floor = jnp.asarray(v_init, dtype=v_pred.dtype)
+    u = jnp.log(jnp.maximum(v_pred, v_floor))                 # log latent variance
     return m, u
 
 
@@ -82,9 +92,11 @@ def e_step(
         Output target as a mean vector. For Gaussian-logit targets (I3),
         this is `y_mean` and the caller should also pass `y_var`.
     output_weight : float
-        Multiplier on the legacy output likelihood term. 1.0 (default) is
-        Algorithm 1; 0.0 is target-free test-time inference (Section 6.6).
-        Used only when `objective == "pc_free_energy"`.
+        Multiplier on the output target term. 1.0 (default) is Algorithm 1;
+        0.0 is target-free test-time inference (Section 6.6 paragraph 1).
+        Applies to both `objective="pc_free_energy"` (scales legacy output
+        likelihood) and `objective="shared_dpc"` (scales the K_out shared-KL
+        term, parallel to legacy behavior).
     y_var : [B, C] or None
         Output target variance for Gaussian-logit targets (assumption I3).
         Required when `objective == "shared_dpc"`. If None, defaults to a
@@ -129,6 +141,7 @@ def e_step(
                 gamma_hidden=gamma_hidden,
                 gamma_output=gamma_output,
                 include_weight_kl=False,
+                output_weight=output_weight,
             )
         else:  # "pc_free_energy"
             F = free_energy(W, x, y, m, v, output_weight=output_weight)
