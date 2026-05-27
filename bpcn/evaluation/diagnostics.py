@@ -79,6 +79,12 @@ def variance_decomposition(net, m_h, v_h, layer_idx: int = -1):
     """Decompose v_pred at a given layer into the three components of Eq. 87.
 
     Used to verify V5: no single component absorbs all uncertainty.
+
+    Note: `m_h`, `v_h` are the *presynaptic* feature moments for the chosen
+    layer (post-psi). For the output layer with `psi != "identity"`, the
+    caller must apply `psi_moments(net.psi, m_z, v_z)` before invoking this
+    function; passing raw latent moments would mis-report the variance
+    decomposition.
     """
     layer = net.layers[layer_idx]
     residual, propagated, epistemic = variance_components(layer, m_h, v_h)

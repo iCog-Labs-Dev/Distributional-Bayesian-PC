@@ -22,6 +22,11 @@ class BaseConfig:
     input_dim: int = 784
     hidden_dim: int = 128
     # output_dim derived from len(classes)
+    # Feature map between the hidden latent z^1 and the presynaptic feature
+    # to the output layer (Section 4.5 of v2 write-up).
+    # "identity" preserves the linear base architecture.
+    # "relu" uses the delta-method ReLU moment propagation.
+    psi: str = "identity"
 
     # --- Initialization (Eqs. 98-99, plan U5) --------------------------------
     init_log_var: float = -6.0               # tau_0 = log sigma_0^2  (sigma_0 ~ 0.05)
@@ -38,7 +43,7 @@ class BaseConfig:
     T_z: int = 8                             # inner E-step iterations
     eta_m: float = 0.1                       # latent mean learning rate
     eta_u: float = 0.05                      # latent log-var learning rate
-    v_init: float = 1e-2                     # initial latent variance (Eq. 100)
+    v_init: float = 1e-2                     # minimum initial latent variance floor
 
     # --- M-step (Algorithm 2, Eqs. 81-82, plan U4-U5) ------------------------
     eta_mu_hidden: float = 1e-3              # hidden mean learning rate
@@ -53,11 +58,15 @@ class BaseConfig:
 
     # --- Output target (assumption I3) ---------------------------------------
     target_var: float = 1e-3                 # epsilon_y for Gaussian one-hot targets
+    target_scale: float = 1.0                # one-hot peak magnitude in logit space.
+                                             # 1.0 caps softmax confidence (~0.23 for
+                                             # C=10) even at perfect regression; raise
+                                             # (e.g. ~5) to lower the NLL/entropy floor.
 
     # --- Shared-energy extension (M-SE) --------------------------------------
     # References: shared_energy_dbpcn_extension.pdf.
-    # objective='pc_free_energy' (LEGACY) recovers runs/base/ numerics: the
-    #   E-step descends Eq. 40 of the original BPCN write-up.
+    # objective='pc_free_energy' (LEGACY) descends Eq. 40 of the original
+    #   BPCN write-up, but uses the current predictive latent initialization.
     # objective='shared_dpc'              switches the E-step to descend the
     #   shared energy F_kappa of extension Eq. 63 (which at kappa=1 is F_DPC
     #   of Eq. 12). The M-step gradient algebra is unchanged in either mode.
@@ -81,7 +90,12 @@ class BaseConfig:
     eval_T_z: Optional[int] = None           # target-free test-time E-step; None -> T_z
     eval_eta_m: Optional[float] = None       # None -> eta_m
     eval_eta_u: Optional[float] = None       # None -> eta_u
-    eval_v_init: Optional[float] = None      # None -> v_init
+    eval_v_init: Optional[float] = None      # target-free variance floor; None -> v_init
+    # Eval E-step objective. None -> match training objective via the
+    # eval_objective_resolved property so train and test inference descend
+    # the same scalar. Set explicitly to "pc_free_energy" or "shared_dpc"
+    # for ablation or regression-test consistency.
+    eval_objective: Optional[str] = None
 
     # --- Output directory ----------------------------------------------------
     run_dir: str = "runs/base"
@@ -100,8 +114,16 @@ class BaseConfig:
             val = getattr(self, name)
             if val is not None and val <= 0:
                 raise ValueError(f"{name} must be > 0 when set, got {val}")
+        if self.psi not in ("identity", "relu"):
+            raise ValueError(f"psi must be 'identity' or 'relu', got {self.psi!r}")
+        if self.target_scale <= 0:
+            raise ValueError(f"target_scale must be > 0, got {self.target_scale}")
         if self.objective not in ("pc_free_energy", "shared_dpc"):
             raise ValueError(f"objective must be 'pc_free_energy' or 'shared_dpc', got {self.objective!r}")
+        if self.eval_objective is not None and self.eval_objective not in ("pc_free_energy", "shared_dpc"):
+            raise ValueError(
+                f"eval_objective must be None, 'pc_free_energy', or 'shared_dpc', got {self.eval_objective!r}"
+            )
         if not 0.0 <= self.kappa_start <= 1.0:
             raise ValueError(f"kappa_start must be in [0, 1], got {self.kappa_start}")
         if self.kappa_warmup_epochs < 0:
@@ -138,6 +160,11 @@ class BaseConfig:
     @property
     def eval_v_init_resolved(self) -> float:
         return self.v_init if self.eval_v_init is None else self.eval_v_init
+
+    @property
+    def eval_objective_resolved(self) -> str:
+        """Eval-time E-step objective; defaults to the training objective."""
+        return self.objective if self.eval_objective is None else self.eval_objective
 
     def kappa_for_epoch(self, epoch: int) -> float:
         """Compute kappa for a given epoch (1-indexed) via linear ramp.

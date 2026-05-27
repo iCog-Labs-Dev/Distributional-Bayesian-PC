@@ -6,7 +6,11 @@ References (write-up: distributional_predictive_coding_v2.pdf):
                               -(N/B) Sum_n H(q_lambda_n)
 - Eq. 36: per-transition negative log density (Gaussian).
 - Eq. 23: linear-in-weights Gaussian transition z^l ~ N(W_l h, B_l^{-1}).
-- Assumption I2 (plan): psi = identity, so h^{l-1} = z^{l-1} and v_h^{l-1} = v_z^{l-1}.
+- psi (Section 4.5): the presynaptic feature for layer l is
+  h^{l-1} = psi_{l-1}(z^{l-1}); moments propagate via `psi_moments` dispatch
+  (`bpcn/inference/feature_moments.py`). For the base BPCN with L_hidden=1
+  the only psi that matters is between z^1 and the output; the input z^0=x
+  is clamped (h^0 = x, v_h^0 = 0). Network.psi selects "identity" or "relu".
 - Assumption I3 (plan): output y treated as a Gaussian-logit observation; the E-step
   uses the EXACT Gaussian likelihood log p(y | z^L, W_y) = log N(y; W_y z^L, B_y^{-1}),
   ignoring the small Gaussian-target variance epsilon_y (which is only used in the
@@ -30,6 +34,7 @@ import jax.numpy as jnp
 from ..models.network import Network
 from ..models.moments import moment_forward
 from ..utils.safe_math import EPS_V
+from .feature_moments import psi_moments
 
 
 _LOG_2PI = float(jnp.log(2.0 * jnp.pi))
@@ -120,8 +125,10 @@ def free_energy(net: Network, x, y, m_l, v_l, *, output_weight: float = 1.0):
         m_h=x, v_h=jnp.zeros_like(x),
         layer=hidden,
     )
-    # Output likelihood: presynaptic is the hidden latent with variance v_l (identity psi).
-    nll_y = output_neg_log_density(y, m_z=m_l, v_z=v_l, layer=output)
+    # Output likelihood: presynaptic feature for the output layer is
+    # psi_1(z^1), with moments propagated through `psi_moments` (Eq. 93).
+    m_h_out, v_h_out = psi_moments(net.psi, m_l, v_l)
+    nll_y = output_neg_log_density(y, m_z=m_h_out, v_z=v_h_out, layer=output)
     neg_H = latent_neg_entropy(v_l)
     F_per_example = nll_1 + output_weight * nll_y + neg_H          # [B]
     return F_per_example.mean()

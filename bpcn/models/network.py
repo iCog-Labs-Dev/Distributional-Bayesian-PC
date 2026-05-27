@@ -22,8 +22,18 @@ class Network(NamedTuple):
     layers : tuple of Layer
         Hidden layers (length L_hidden) followed by the output layer.
         layers[-1] is the output layer W_y.
+    psi : str
+        Feature map between the hidden latent z^1 and the presynaptic
+        feature into the next layer (Section 4.5). One of:
+        - "identity" (default): pass-through, original linear stage.
+        - "relu"   : ReLU with delta-method moment propagation
+                     (Section 4.5 option 2; `relu_delta_moments` in
+                     `bpcn/inference/feature_moments.py`).
+        For L_hidden == 1, this is the single psi between z^1 and the
+        output layer.
     """
     layers: Tuple[Layer, ...]
+    psi: str = "identity"
 
     @property
     def L_hidden(self) -> int:
@@ -40,6 +50,25 @@ class Network(NamedTuple):
         return self.layers[0]
 
 
+# Register Network as a JAX pytree where `psi` is static auxiliary data
+# (so it is part of the tree definition rather than a traceable leaf).
+# Without this, NamedTuple's default treats `psi: str` as a leaf and JAX
+# transforms (e.g. stop_gradient, jit) fail because strings aren't JAX
+# types.
+def _network_flatten(net: "Network"):
+    children = (net.layers,)
+    aux_data = net.psi
+    return children, aux_data
+
+
+def _network_unflatten(aux_data, children):
+    (layers,) = children
+    return Network(layers=layers, psi=aux_data)
+
+
+jax.tree_util.register_pytree_node(Network, _network_flatten, _network_unflatten)
+
+
 def init_network(
     key: jax.Array,
     layer_dims: Tuple[int, ...],
@@ -51,6 +80,7 @@ def init_network(
     init_log_var: float = -6.0,
     hidden_init: str = "xavier",
     output_init: str = "xavier",
+    psi: str = "identity",
 ) -> Network:
     """Initialize a network from a list of layer widths.
 
@@ -96,7 +126,7 @@ def init_network(
             init_log_var=init_log_var,
         )
     )
-    return Network(layers=tuple(layers))
+    return Network(layers=tuple(layers), psi=psi)
 
 
 def forward_mean(net: Network, x: jax.Array) -> jax.Array:

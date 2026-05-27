@@ -41,6 +41,8 @@ The two scales are exposed as `data_scale` (default 1/B) and `prior_scale`
 
 The output layer (W_y) uses the SAME update with the target taken as the
 Gaussian-logit observation (m_z = y_mean, v_z = y_var)  (assumption I3).
+Its presynaptic feature is psi_1(z^1), with moments propagated through
+`psi_moments` (Section 4.5; default psi="identity").
 """
 from typing import NamedTuple, Tuple
 import jax
@@ -49,6 +51,7 @@ import jax.numpy as jnp
 from ..models.layer import Layer
 from ..models.moments import moment_forward
 from ..utils.safe_math import floor_v, clamp_tau
+from ..inference.feature_moments import psi_moments
 
 
 class LayerDiagnostics(NamedTuple):
@@ -264,11 +267,13 @@ def m_step(
         mu_old=mu_old_h, tau_old=tau_old_h,
     )
 
-    # Output layer target = (y_mean, y_var) [Gaussian-logit; assumption I3];
-    # presynaptic = frozen latent (m_z, v_z) (identity psi_1).
+    # Output layer target = (y_mean, y_var) [Gaussian-logit; assumption I3].
+    # Presynaptic feature = psi_1(z^1); moments propagate via psi_moments
+    # (Section 4.5; default psi="identity" recovers the pass-through case).
+    M_out, V_out = psi_moments(net.psi, frozen.m_z, frozen.v_z)
     new_output, out_diags = update_layer(
         output,
-        M=frozen.m_z, V=frozen.v_z,
+        M=M_out, V=V_out,
         m_z=y_mean, v_z=y_var,
         alpha=alpha_output, gamma=gamma_output,
         eta_mu=eta_mu_output, eta_tau=eta_tau_output,

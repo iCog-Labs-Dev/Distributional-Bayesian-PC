@@ -39,6 +39,7 @@ from ..models.network import Network
 from ..models.moments import moment_forward
 from ..losses.distributional_kl import gaussian_kl
 from ..losses.weight_kl import gaussian_weight_kl
+from .feature_moments import psi_moments
 from .free_energy import transition_neg_log_density, latent_neg_entropy
 
 
@@ -56,9 +57,15 @@ def _hidden_predictive(net: Network, x):
 
 
 def _output_predictive(net: Network, m_l, v_l):
-    """Predictive moments of the output transition (identity psi_1, I2)."""
+    """Predictive moments of the output transition.
+
+    The presynaptic feature for the output layer is psi_1(z^1); moments
+    propagate via `psi_moments(net.psi, m_l, v_l)` (Eq. 93 / Section 4.5).
+    Default `psi="identity"` recovers the linear base.
+    """
     output = net.layers[1]
-    return moment_forward(output, m_l, v_l)
+    m_h, v_h = psi_moments(net.psi, m_l, v_l)
+    return moment_forward(output, m_h, v_h)
 
 
 def _weight_kl_total(
@@ -135,6 +142,7 @@ def shared_free_energy(
     gamma_output: float = 1.0,
     include_weight_kl: bool = True,
     weight_kl_scale: float = 1.0,
+    output_weight: float = 1.0,
 ) -> jax.Array:
     """F_kappa from extension Eq. 63 at (lambda=(m_l, v_l), phi=net).
 
@@ -158,6 +166,12 @@ def shared_free_energy(
         match the per-data-point M-step gradient scale; default 1.0 = the
         full-data convention of extension Eq. 12 (used by S11/S13 paired with
         m_step(prior_scale=1)). Ignored when `include_weight_kl=False`.
+    output_weight : float
+        Multiplier on K_out (the output-target shared-KL term). 1.0 = full
+        observed target (extension Section 4 / Algorithm 1); 0.0 = target-free
+        test-time inference (v2 write-up Section 6.6 paragraph 1) where the
+        latent is anchored only by the hidden transition. Parallel to the
+        `output_weight` kwarg in legacy `free_energy.free_energy`.
     """
     assert net.L_hidden == 1, "shared_free_energy assumes L_hidden == 1 (base BPCN)"
     hidden = net.layers[0]
@@ -175,7 +189,8 @@ def shared_free_energy(
     m_py, v_py = _output_predictive(net, m_l, v_l)
     K_out = gaussian_kl(m_z=y_mean, v_z=y_var, m_p=m_py, v_p=v_py).kl.sum(axis=-1).mean()
 
-    total = K_out + hidden_term
+    output_weight_arr = jnp.asarray(output_weight, dtype=m_l.dtype)
+    total = output_weight_arr * K_out + hidden_term
     if include_weight_kl:
         total = total + _weight_kl_total(
             net, gamma_hidden, gamma_output, weight_kl_scale=weight_kl_scale
