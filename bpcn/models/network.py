@@ -31,9 +31,30 @@ class Network(NamedTuple):
                      `bpcn/inference/feature_moments.py`).
         For L_hidden == 1, this is the single psi between z^1 and the
         output layer.
+    output_likelihood : str
+        Form of the output-boundary likelihood. See
+        `categorical_output_dbpcn_continuation.pdf` for the categorical
+        variant. One of:
+        - "gaussian"    (default): I3 Gaussian-logit head, output term is
+                        the inclusion-KL between N(y_mean, y_var) and the
+                        Gaussian predictive at layer L (Eq. 12 of the
+                        shared-energy note).
+        - "categorical" : Bayesian softmax head
+                        p(y=c|z^L, W_y) = softmax(W_y psi_L(z^L))_c
+                        (Eq. 1/18 of the continuation note). Output term is
+                        the categorical NLL averaged over the chosen
+                        estimator (`output_estimator`).
+    output_estimator : str
+        Categorical F_out estimator. Only consulted when
+        `output_likelihood == "categorical"`. One of:
+        - "mean" : posterior-mean classifier ell^mean (Eq. 21 of continuation).
+        - "mc"   : Monte Carlo categorical NLL ell^MC (Eq. 27 of continuation)
+                   via reparameterized output weights and top latents.
     """
     layers: Tuple[Layer, ...]
     psi: str = "identity"
+    output_likelihood: str = "gaussian"
+    output_estimator: str = "mean"
 
     @property
     def L_hidden(self) -> int:
@@ -50,20 +71,27 @@ class Network(NamedTuple):
         return self.layers[0]
 
 
-# Register Network as a JAX pytree where `psi` is static auxiliary data
-# (so it is part of the tree definition rather than a traceable leaf).
+# Register Network as a JAX pytree where the string fields (`psi`,
+# `output_likelihood`, `output_estimator`) are static auxiliary data, so
+# they are part of the tree definition rather than traceable leaves.
 # Without this, NamedTuple's default treats `psi: str` as a leaf and JAX
 # transforms (e.g. stop_gradient, jit) fail because strings aren't JAX
 # types.
 def _network_flatten(net: "Network"):
     children = (net.layers,)
-    aux_data = net.psi
+    aux_data = (net.psi, net.output_likelihood, net.output_estimator)
     return children, aux_data
 
 
 def _network_unflatten(aux_data, children):
     (layers,) = children
-    return Network(layers=layers, psi=aux_data)
+    psi, output_likelihood, output_estimator = aux_data
+    return Network(
+        layers=layers,
+        psi=psi,
+        output_likelihood=output_likelihood,
+        output_estimator=output_estimator,
+    )
 
 
 jax.tree_util.register_pytree_node(Network, _network_flatten, _network_unflatten)
@@ -81,6 +109,8 @@ def init_network(
     hidden_init: str = "xavier",
     output_init: str = "xavier",
     psi: str = "identity",
+    output_likelihood: str = "gaussian",
+    output_estimator: str = "mean",
 ) -> Network:
     """Initialize a network from a list of layer widths.
 
@@ -94,6 +124,12 @@ def init_network(
         Residual variances (Eq. 24, A4).
     init_log_var : float
         Initial tau (Eq. 99).
+    psi : str
+        Feature map between hidden latent z^1 and the output presynaptic
+        feature (Section 4.5).
+    output_likelihood, output_estimator : str
+        Output-boundary configuration (categorical_output_dbpcn_continuation.pdf).
+        Defaults preserve the I3 Gaussian-logit head.
     """
     if len(layer_dims) < 2:
         raise ValueError("Need at least input + output dims")
@@ -126,7 +162,12 @@ def init_network(
             init_log_var=init_log_var,
         )
     )
-    return Network(layers=tuple(layers), psi=psi)
+    return Network(
+        layers=tuple(layers),
+        psi=psi,
+        output_likelihood=output_likelihood,
+        output_estimator=output_estimator,
+    )
 
 
 def forward_mean(net: Network, x: jax.Array) -> jax.Array:

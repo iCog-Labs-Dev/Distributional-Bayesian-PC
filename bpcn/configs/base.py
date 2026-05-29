@@ -16,7 +16,14 @@ class BaseConfig:
     # --- Dataset (plan §3.1) -------------------------------------------------
     classes: Tuple[int, ...] = (0, 1)        # base = 2-class MNIST (digits 0, 1)
     batch_size: int = 128
-    n_train_total: int = 12000               # approximate train count for digits 0, 1
+    # n_train_total / n_test_total are populated at runtime by
+    # experiments.mnist.run(...) AFTER class filtering: they hold the actual
+    # number of (post-filter) train / test examples used by this run, so the
+    # saved config.json reflects the real dataset size. Default 0 means
+    # "not yet populated" -- before run() has loaded the data. NOT consumed by
+    # any training math; informational only.
+    n_train_total: int = 0
+    n_test_total: int = 0
 
     # --- Architecture (plan §3.1, I1, I2) ------------------------------------
     input_dim: int = 784
@@ -57,11 +64,42 @@ class BaseConfig:
                                              # (Section 6.7: "one or a few" updates)
 
     # --- Output target (assumption I3) ---------------------------------------
+    # NOTE: `target_var` and `target_scale` are consumed only when
+    # `output_likelihood == "gaussian"` (the I3 Gaussian-logit head). Under
+    # `output_likelihood == "categorical"` (categorical_output_dbpcn_continuation.pdf)
+    # they are ignored; the loss is softmax NLL and the target is the integer
+    # class index `y_idx`.
     target_var: float = 1e-3                 # epsilon_y for Gaussian one-hot targets
     target_scale: float = 1.0                # one-hot peak magnitude in logit space.
                                              # 1.0 caps softmax confidence (~0.23 for
                                              # C=10) even at perfect regression; raise
                                              # (e.g. ~5) to lower the NLL/entropy floor.
+
+    # --- Categorical output head (continuation note) -------------------------
+    # References: categorical_output_dbpcn_continuation.pdf.
+    # `output_likelihood`:
+    #   "gaussian"    (default, legacy) -- the I3 Gaussian-logit head; the
+    #                 output term in F is the inclusion-KL between
+    #                 N(y_mean, y_var) and the Gaussian predictive (m_p^L,
+    #                 v_p^L). `target_var`/`target_scale` control encoding.
+    #   "categorical" -- Bayesian softmax head p(y=c|z^L,W_y) = softmax(W_y
+    #                 psi_L(z^L))_c (Eq. 1/18 of the continuation). Output
+    #                 term in F is the categorical NLL averaged over the
+    #                 chosen estimator. Target is `y_idx` (integer class).
+    # `output_estimator` selects the F_out estimator when categorical:
+    #   "mean"        -- posterior-mean classifier (Eq. 21–22 of continuation).
+    #                 Deterministic; data gradient updates only mu_y / m_z^L.
+    #   "mc"          -- MC categorical NLL via reparameterized weights and
+    #                 latents (Eq. 24–27). Bayes-by-Backprop-style gradient
+    #                 on (mu_y, tau_y, m_z^L, v_z^L).
+    # `mc_samples_train` is S used by the MC estimator during training (1 is
+    # the BBB default). `lambda_y` is the output-loss weight in Eq. 2/48 of
+    # the continuation (F_cat-DPC = lambda_y F_out + F_trans-DPC + F_weight-KL);
+    # 1.0 = matched to F_trans-DPC.
+    output_likelihood: str = "gaussian"
+    output_estimator: str = "mean"
+    mc_samples_train: int = 1
+    lambda_y: float = 1.0
 
     # --- Shared-energy extension (M-SE) --------------------------------------
     # References: shared_energy_dbpcn_extension.pdf.
@@ -136,6 +174,19 @@ class BaseConfig:
             raise ValueError(f"r_max must be > 0 when set, got {self.r_max}")
         if not 0.0 < self.accept_damp_omega <= 1.0:
             raise ValueError(f"accept_damp_omega must be in (0, 1], got {self.accept_damp_omega}")
+        if self.output_likelihood not in ("gaussian", "categorical"):
+            raise ValueError(
+                f"output_likelihood must be 'gaussian' or 'categorical', "
+                f"got {self.output_likelihood!r}"
+            )
+        if self.output_estimator not in ("mean", "mc"):
+            raise ValueError(
+                f"output_estimator must be 'mean' or 'mc', got {self.output_estimator!r}"
+            )
+        if self.mc_samples_train < 1:
+            raise ValueError(f"mc_samples_train must be >= 1, got {self.mc_samples_train}")
+        if self.lambda_y <= 0:
+            raise ValueError(f"lambda_y must be > 0, got {self.lambda_y}")
 
     @property
     def output_dim(self) -> int:
