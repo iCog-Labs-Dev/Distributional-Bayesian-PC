@@ -80,6 +80,11 @@ def e_step(
     rho_z: float = 0.0,
     gamma_hidden: float = 1.0,
     gamma_output: float = 1.0,
+    # Categorical-output kwargs (continuation note). Consumed only when
+    # `net.output_likelihood == "categorical"`; harmless under "gaussian".
+    y_idx=None,
+    key=None,
+    mc_samples_train: int = 1,
 ) -> Tuple[FrozenLatents, EStepDiagnostics]:
     """Run T_z latent gradient steps then freeze (Algorithm 1 / extension Alg. 1).
 
@@ -117,6 +122,12 @@ def e_step(
         Per-layer prior-KL coefficients gamma_l. Forwarded to shared energy
         for include_weight_kl=False (E-step does not need the constant
         weight-KL term in its scalar; the M-step uses these via m_step).
+    y_idx, key, mc_samples_train
+        Categorical-output kwargs. Required when `net.output_likelihood ==
+        "categorical"`. `y_idx` is the [B] integer-class target. `key` is
+        the PRNG key for MC sampling; the inner scan splits one fresh key
+        per iteration so each T_z step uses independent randomness. Under
+        `output_likelihood == "gaussian"` these are ignored.
     """
     if objective not in ("pc_free_energy", "shared_dpc"):
         raise ValueError(f"unknown objective: {objective!r}")
@@ -126,17 +137,43 @@ def e_step(
 
     if y_var is None:
         y_var = jnp.zeros_like(y)
+    # Categorical-mode label safety: the y_idx=None fallback below substitutes
+    # a dummy "class 0 for every example" tensor. That is only safe when the
+    # output term is disabled (output_weight == 0; v2 Section 6.6 target-free
+    # inference) -- with a non-zero output term it silently grades the entire
+    # batch against class 0 and produces wrong latent updates. Surface the
+    # caller error explicitly instead of letting it slip past.
+    if (
+        net.output_likelihood == "categorical"
+        and y_idx is None
+        and float(output_weight) != 0.0
+    ):
+        raise ValueError(
+            "e_step requires `y_idx` when net.output_likelihood == 'categorical' "
+            "and output_weight != 0. Pass the integer class targets explicitly, "
+            "or set output_weight=0.0 for target-free inference (Section 6.6)."
+        )
+    # Placeholder y_idx for Gaussian mode (the F call is shape-stable) and for
+    # categorical target-free inference (the dummy is multiplied by 0).
+    if y_idx is None:
+        B = y.shape[0]
+        y_idx = jnp.zeros((B,), dtype=jnp.int32)
+    # Always feed a real key into the F call so the MC reparam branch can
+    # split it. Gaussian and MEAN paths ignore the key.
+    if key is None:
+        key = jax.random.PRNGKey(0)
 
     use_prox = float(rho_z) != 0.0
     # Stop-gradient through prox anchors so they don't flow back into params.
     m_init = jax.lax.stop_gradient(m0) if use_prox else None
     u_init = jax.lax.stop_gradient(u0) if use_prox else None
 
-    def F_of_log_var(m, u):
+    def F_of_log_var(m, u, k):
         v = jnp.exp(u)
         if objective == "shared_dpc":
             F = shared_free_energy(
                 W, x, y, y_var, m, v,
+                y_idx=y_idx, key=k, mc_samples_train=mc_samples_train,
                 kappa=kappa,
                 gamma_hidden=gamma_hidden,
                 gamma_output=gamma_output,
@@ -144,7 +181,11 @@ def e_step(
                 output_weight=output_weight,
             )
         else:  # "pc_free_energy"
-            F = free_energy(W, x, y, m, v, output_weight=output_weight)
+            F = free_energy(
+                W, x, y, m, v,
+                output_weight=output_weight,
+                y_idx=y_idx, key=k, mc_samples_train=mc_samples_train,
+            )
         if use_prox:
             # Proximal latent damping (extension Eq. 65). Anchored at the
             # feedforward initial (m_init, u_init).
@@ -155,16 +196,20 @@ def e_step(
 
     grad_fn = jax.grad(F_of_log_var, argnums=(0, 1))
 
-    def step(carry, _):
+    def step(carry, k):
         m, u = carry
-        gm, gu = grad_fn(m, u)
+        gm, gu = grad_fn(m, u, k)
         m_new = m - eta_m * gm                              # Eq. 43 / extension Eq. 57
         u_new = clamp_u(u - eta_u * gu)                     # Eq. 43 + Algorithm 1 step 4e
-        F_new = F_of_log_var(m_new, u_new)
+        F_new = F_of_log_var(m_new, u_new, k)
         return (m_new, u_new), F_new
 
-    (m_final, u_final), F_trace = jax.lax.scan(step, (m0, u0), None, length=T_z)
-    F_initial = F_of_log_var(m0, u0)
+    # Fresh key per inner-loop iteration so MC samples are independent
+    # across the T_z steps. Under Gaussian / MEAN the keys are unused but
+    # threading them keeps the compiled graph constant.
+    keys_scan = jax.random.split(key, T_z)
+    (m_final, u_final), F_trace = jax.lax.scan(step, (m0, u0), keys_scan, length=T_z)
+    F_initial = F_of_log_var(m0, u0, keys_scan[0])
 
     # Freeze (Eq. 49 / Eq. 92): stop_gradient + record final statistics.
     m_z = jax.lax.stop_gradient(m_final)

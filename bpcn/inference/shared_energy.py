@@ -11,14 +11,22 @@ References (write-up: shared_energy_dbpcn_extension.pdf):
 - Eq. 72: F_DPC = F_out + F_trans-DPC + F_weight-KL (decomposition for logging).
 
 For the base BPCN (L_hidden == 1) this decomposes as:
-- F_out         : KL(N(y_mean, y_var) || q_pred,output(z_y)) summed over output
-                  units, mean over batch. Uses (y_mean, y_var) Gaussian-logit
-                  targets (assumption I3 of distributional_predictive_coding_v2.pdf
-                  Section 8.2 Option 2). Same target encoding as the existing
-                  M-step output update in bpcn/training/m_step.py:m_step.
+- F_out         : Output-boundary term. Form depends on
+                  `net.output_likelihood`:
+                    * "gaussian"    -> KL(N(y_mean, y_var) || q_pred,output(z_y))
+                                       summed over output units, mean over batch
+                                       (assumption I3 of v2 Section 8.2 Option 2).
+                    * "categorical" -> softmax NLL via MEAN (Eq. 21 of
+                                       categorical_output_dbpcn_continuation.pdf)
+                                       or MC (Eq. 27) on the integer-class target
+                                       `y_idx`. F_cat-DPC = lambda_y F_out +
+                                       F_trans-DPC + F_weight-KL (continuation
+                                       Eq. 2/48).
 - F_trans_dpc   : KL(N(m_l, v_l) || q_pred,hidden(z^1)) summed over hidden units,
-                  mean over batch.
-- F_weight_kl   : Sum_l gamma_l Sum_{ij} KL(q_phi_l(w_ij) || p(w_ij)) using Eq. 77.
+                  mean over batch. Unchanged across output-likelihood modes.
+- F_weight_kl   : Sum_l gamma_l Sum_{ij} KL(q_phi_l(w_ij) || p(w_ij)) using Eq. 77
+                  of v2 (== Eq. 44 of the continuation note for the output head;
+                  algebraically identical).
 
 Backward compatibility note. At kappa=0 the hidden-transition term becomes
 (NLL + neg-entropy) -- matching the *hidden* part of the legacy Eq. 40
@@ -41,6 +49,7 @@ from ..losses.distributional_kl import gaussian_kl
 from ..losses.weight_kl import gaussian_weight_kl
 from .feature_moments import psi_moments
 from .free_energy import transition_neg_log_density, latent_neg_entropy
+from .categorical_output import categorical_output_loss
 
 
 class SharedEnergyTerms(NamedTuple):
@@ -91,6 +100,31 @@ def _weight_kl_total(
     return weight_kl_scale * (gamma_hidden * Kw_h + gamma_output * Kw_o)
 
 
+def _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train):
+    """Compute F_out for the active output-likelihood mode.
+
+    Returns a scalar batch-mean F_out in per-data-point scale.
+
+    - Gaussian (legacy): inclusion-KL between N(y_mean, y_var) and the
+      Gaussian predictive at layer L (Eq. 12 of M-SE extension; assumption
+      I3 of v2 Section 8.2 Option 2).
+    - Categorical (continuation Eq. 2/48): MEAN or MC softmax NLL on the
+      integer-class target `y_idx`. `key` and `mc_samples_train` are only
+      consulted under the MC estimator; passing dummy values when MEAN is
+      harmless (the dispatcher ignores them).
+    """
+    if net.output_likelihood == "gaussian":
+        m_py, v_py = _output_predictive(net, m_l, v_l)
+        return gaussian_kl(m_z=y_mean, v_z=y_var, m_p=m_py, v_p=v_py).kl.sum(axis=-1).mean()
+    elif net.output_likelihood == "categorical":
+        return categorical_output_loss(net, m_l, v_l, y_idx, key, mc_samples_train)
+    else:
+        raise ValueError(
+            f"unknown output_likelihood: {net.output_likelihood!r}; "
+            f"choices: 'gaussian', 'categorical'"
+        )
+
+
 def shared_energy_terms(
     net: Network,
     x: jax.Array,
@@ -99,14 +133,26 @@ def shared_energy_terms(
     m_l: jax.Array,
     v_l: jax.Array,
     *,
+    y_idx=None,
+    key=None,
+    mc_samples_train: int = 1,
     gamma_hidden: float = 1.0,
     gamma_output: float = 1.0,
     weight_kl_scale: float = 1.0,
+    output_weight: float = 1.0,
 ) -> SharedEnergyTerms:
     """Return the three decomposed terms of F_DPC at kappa=1 (extension Eq. 72).
 
-    Sum of the three equals F_DPC at kappa=1 with include_weight_kl=True.
-    Used for diagnostics and unit tests (S10/S12).
+    Sum of the three equals F_cat-DPC at kappa=1 with include_weight_kl=True
+    and `output_weight = lambda_y` -- i.e. exactly the scalar the M-step
+    descends. Used for diagnostics and unit tests (S10/S12).
+
+    `output_weight` (== `lambda_y` under the categorical head, Eq. 2/48 of
+    `categorical_output_dbpcn_continuation.pdf`) is folded into the returned
+    `f_out` so that `f_out + f_trans_dpc + f_weight_kl` matches the descent
+    scalar even when lambda_y != 1. Default 1.0 preserves the legacy raw
+    decomposition. Pass `cfg.lambda_y` to keep the diagnostic and the
+    E-step / M-step descent aligned.
 
     `weight_kl_scale` rescales the returned `f_weight_kl` so the sum
     (f_out + f_trans_dpc + f_weight_kl) is on a consistent scale. The data
@@ -117,12 +163,17 @@ def shared_energy_terms(
     on the full-data scale of extension Eq. 12, which mixes scales when added
     to the batch-averaged data terms and is intended only for unit tests that
     pair it with a matched M-step (prior_scale=1).
+
+    `y_idx`, `key`, `mc_samples_train` are consumed only when
+    `net.output_likelihood == "categorical"`. Under "gaussian" they default
+    to harmless placeholders.
     """
     assert net.L_hidden == 1, "shared_energy_terms assumes L_hidden == 1 (base BPCN)"
     m_p1, v_p1 = _hidden_predictive(net, x)
     f_trans_dpc = gaussian_kl(m_z=m_l, v_z=v_l, m_p=m_p1, v_p=v_p1).kl.sum(axis=-1).mean()
-    m_py, v_py = _output_predictive(net, m_l, v_l)
-    f_out = gaussian_kl(m_z=y_mean, v_z=y_var, m_p=m_py, v_p=v_py).kl.sum(axis=-1).mean()
+    f_out_raw = _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train)
+    output_weight_arr = jnp.asarray(output_weight, dtype=f_out_raw.dtype)
+    f_out = output_weight_arr * f_out_raw
     f_weight_kl = _weight_kl_total(
         net, gamma_hidden, gamma_output, weight_kl_scale=weight_kl_scale
     )
@@ -137,6 +188,9 @@ def shared_free_energy(
     m_l: jax.Array,
     v_l: jax.Array,
     *,
+    y_idx=None,
+    key=None,
+    mc_samples_train: int = 1,
     kappa=1.0,
     gamma_hidden: float = 1.0,
     gamma_output: float = 1.0,
@@ -167,11 +221,20 @@ def shared_free_energy(
         full-data convention of extension Eq. 12 (used by S11/S13 paired with
         m_step(prior_scale=1)). Ignored when `include_weight_kl=False`.
     output_weight : float
-        Multiplier on K_out (the output-target shared-KL term). 1.0 = full
+        Multiplier on F_out (the output-boundary term). 1.0 = full
         observed target (extension Section 4 / Algorithm 1); 0.0 = target-free
         test-time inference (v2 write-up Section 6.6 paragraph 1) where the
         latent is anchored only by the hidden transition. Parallel to the
-        `output_weight` kwarg in legacy `free_energy.free_energy`.
+        `output_weight` kwarg in legacy `free_energy.free_energy`. Under the
+        categorical output head this multiplier plays the role of `lambda_y`
+        (Eq. 2/48 of `categorical_output_dbpcn_continuation.pdf`): set it
+        from `cfg.lambda_y` to use a non-1.0 task weight.
+    y_idx, key, mc_samples_train
+        Categorical-mode kwargs. Ignored when `net.output_likelihood ==
+        "gaussian"`. Under `"categorical"`, `y_idx` (shape [B], int) is the
+        target class index; `key` is the PRNG key for the MC estimator;
+        `mc_samples_train` is the static number of MC samples. The MEAN
+        estimator ignores `key` and `mc_samples_train`.
     """
     assert net.L_hidden == 1, "shared_free_energy assumes L_hidden == 1 (base BPCN)"
     hidden = net.layers[0]
@@ -185,12 +248,13 @@ def shared_free_energy(
     neg_H = latent_neg_entropy(v_l).mean()
     kappa_arr = jnp.asarray(kappa, dtype=m_l.dtype)
     hidden_term = (1.0 - kappa_arr) * (nll_1 + neg_H) + kappa_arr * K_hidden_dpc
-    # Output transition: always shared-KL form, not annealed (extension Eq. 63).
-    m_py, v_py = _output_predictive(net, m_l, v_l)
-    K_out = gaussian_kl(m_z=y_mean, v_z=y_var, m_p=m_py, v_p=v_py).kl.sum(axis=-1).mean()
+    # Output boundary term: Gaussian inclusion-KL (legacy) or categorical
+    # softmax NLL (continuation Eq. 2/48). Not annealed by kappa
+    # (extension Eq. 63).
+    F_out = _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train)
 
     output_weight_arr = jnp.asarray(output_weight, dtype=m_l.dtype)
-    total = output_weight_arr * K_out + hidden_term
+    total = output_weight_arr * F_out + hidden_term
     if include_weight_kl:
         total = total + _weight_kl_total(
             net, gamma_hidden, gamma_output, weight_kl_scale=weight_kl_scale

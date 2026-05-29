@@ -52,6 +52,7 @@ from ..models.layer import Layer
 from ..models.moments import moment_forward
 from ..utils.safe_math import floor_v, clamp_tau
 from ..inference.feature_moments import psi_moments
+from ..inference.categorical_output import categorical_output_update
 
 
 class LayerDiagnostics(NamedTuple):
@@ -236,6 +237,12 @@ def m_step(
     r_max=None,
     rho_w: float = 0.0,
     net_old=None,
+    # Categorical-output kwargs (continuation note). Consumed only when
+    # `net.output_likelihood == "categorical"`; harmless under "gaussian".
+    y_idx=None,
+    key=None,
+    mc_samples_train: int = 1,
+    lambda_y: float = 1.0,
 ):
     """One full M-step for the base BPCN (1 hidden + 1 output).
 
@@ -243,6 +250,15 @@ def m_step(
     `net_old` : Network or None
         Reference network for the proximal weight damping term (extension
         Eq. 64). Only used when rho_w > 0. Default None = no damping.
+
+    Output-layer update branches on `net.output_likelihood`:
+    - "gaussian"    -> closed-form Eqs. 81-82 via `update_layer(...)` with
+                       (y_mean, y_var) as the frozen target.
+    - "categorical" -> jax.grad-based update on lambda_y * F_out + gamma_y
+                       * KL(q(W_y)||p(W_y)), where F_out is the MEAN or MC
+                       softmax NLL (continuation Eqs. 21/27). The hidden
+                       layer's `update_layer(...)` call is unchanged in
+                       either mode.
     """
     hidden = net.layers[0]
     output = net.layers[1]
@@ -267,20 +283,55 @@ def m_step(
         mu_old=mu_old_h, tau_old=tau_old_h,
     )
 
-    # Output layer target = (y_mean, y_var) [Gaussian-logit; assumption I3].
-    # Presynaptic feature = psi_1(z^1); moments propagate via psi_moments
-    # (Section 4.5; default psi="identity" recovers the pass-through case).
-    M_out, V_out = psi_moments(net.psi, frozen.m_z, frozen.v_z)
-    new_output, out_diags = update_layer(
-        output,
-        M=M_out, V=V_out,
-        m_z=y_mean, v_z=y_var,
-        alpha=alpha_output, gamma=gamma_output,
-        eta_mu=eta_mu_output, eta_tau=eta_tau_output,
-        data_scale=data_scale, prior_scale=prior_scale,
-        r_max=r_max, rho_w=rho_w,
-        mu_old=mu_old_o, tau_old=tau_old_o,
-    )
+    if net.output_likelihood == "gaussian":
+        # Output layer target = (y_mean, y_var) [Gaussian-logit; assumption I3].
+        # Presynaptic feature = psi_1(z^1); moments propagate via psi_moments
+        # (Section 4.5; default psi="identity" recovers the pass-through case).
+        M_out, V_out = psi_moments(net.psi, frozen.m_z, frozen.v_z)
+        new_output, out_diags = update_layer(
+            output,
+            M=M_out, V=V_out,
+            m_z=y_mean, v_z=y_var,
+            alpha=alpha_output, gamma=gamma_output,
+            eta_mu=eta_mu_output, eta_tau=eta_tau_output,
+            data_scale=data_scale, prior_scale=prior_scale,
+            r_max=r_max, rho_w=rho_w,
+            mu_old=mu_old_o, tau_old=tau_old_o,
+        )
+    elif net.output_likelihood == "categorical":
+        # Categorical softmax head (Eq. 43 of continuation note). Uses
+        # jax.grad on the categorical loss + weight-KL objective. Note that
+        # proximal weight damping (rho_w) is not applied here; if needed,
+        # it could be added by extending categorical_output_update with the
+        # extension Eq. 64 anchor (mu_old_o, tau_old_o). For now the
+        # damping is a Gaussian-mode safeguard.
+        if y_idx is None:
+            raise ValueError(
+                "m_step requires `y_idx` when net.output_likelihood == 'categorical'"
+            )
+        if key is None:
+            # Fallback PRNG key. The training loop should always pass a key;
+            # this is here so unit-test call sites that only build single-step
+            # examples in MEAN mode don't crash.
+            key = jax.random.PRNGKey(0)
+        new_output, out_diags = categorical_output_update(
+            output, frozen, y_idx, key,
+            estimator=net.output_estimator,
+            S=int(mc_samples_train),
+            alpha=alpha_output,
+            gamma=gamma_output,
+            eta_mu=eta_mu_output,
+            eta_tau=eta_tau_output,
+            data_scale=data_scale,
+            prior_scale=prior_scale,
+            lambda_y=lambda_y,
+            psi=net.psi,
+        )
+    else:
+        raise ValueError(
+            f"unknown output_likelihood: {net.output_likelihood!r}; "
+            f"choices: 'gaussian', 'categorical'"
+        )
 
     new_net = net._replace(layers=(new_hidden, new_output))
     return new_net, {"hidden": hid_diags, "output": out_diags}

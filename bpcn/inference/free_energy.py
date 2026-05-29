@@ -35,6 +35,7 @@ from ..models.network import Network
 from ..models.moments import moment_forward
 from ..utils.safe_math import EPS_V
 from .feature_moments import psi_moments
+from .categorical_output import categorical_output_loss
 
 
 _LOG_2PI = float(jnp.log(2.0 * jnp.pi))
@@ -96,7 +97,13 @@ def latent_neg_entropy(v_l):
     return -0.5 * jnp.log(v_l).sum(axis=-1)
 
 
-def free_energy(net: Network, x, y, m_l, v_l, *, output_weight: float = 1.0):
+def free_energy(
+    net: Network, x, y, m_l, v_l, *,
+    output_weight: float = 1.0,
+    y_idx=None,
+    key=None,
+    mc_samples_train: int = 1,
+):
     """Latent inference free energy F_z (Eq. 40) for the base BPCN (L_hidden = 1).
 
     Parameters
@@ -105,11 +112,21 @@ def free_energy(net: Network, x, y, m_l, v_l, *, output_weight: float = 1.0):
     x   : [B, d_0]           inputs (z^0).
     y   : [B, C]             observed one-hot logit targets (m_z^{out}).
                               Ignored when output_weight == 0 (Section 6.6 test-time use).
+                              Under `net.output_likelihood == "categorical"` this
+                              is also unused (the categorical loss reads `y_idx`);
+                              callers may still pass the Gaussian one-hot to keep
+                              call sites uniform.
     m_l : [B, d_1]           latent mean of the single hidden layer.
     v_l : [B, d_1]           latent variance.
     output_weight : float    Multiplier on the output likelihood term.
                               1.0 -> training (label observed; Algorithm 1).
                               0.0 -> test-time target-free inference (Section 6.6).
+                              Under the categorical head this plays the role of
+                              `lambda_y` (Eq. 2/48 of the continuation note).
+    y_idx, key, mc_samples_train
+        Categorical-mode kwargs. Ignored when `net.output_likelihood ==
+        "gaussian"`. Under `"categorical"` the output term becomes the
+        MEAN/MC softmax NLL of Section 4 of `categorical_output_dbpcn_continuation.pdf`.
 
     Returns
     -------
@@ -125,10 +142,24 @@ def free_energy(net: Network, x, y, m_l, v_l, *, output_weight: float = 1.0):
         m_h=x, v_h=jnp.zeros_like(x),
         layer=hidden,
     )
-    # Output likelihood: presynaptic feature for the output layer is
-    # psi_1(z^1), with moments propagated through `psi_moments` (Eq. 93).
-    m_h_out, v_h_out = psi_moments(net.psi, m_l, v_l)
-    nll_y = output_neg_log_density(y, m_z=m_h_out, v_z=v_h_out, layer=output)
-    neg_H = latent_neg_entropy(v_l)
-    F_per_example = nll_1 + output_weight * nll_y + neg_H          # [B]
-    return F_per_example.mean()
+    # Output boundary term.
+    if net.output_likelihood == "gaussian":
+        # Presynaptic feature is psi_1(z^1), moments via `psi_moments` (Eq. 93).
+        m_h_out, v_h_out = psi_moments(net.psi, m_l, v_l)
+        # Per-example Gaussian NLL (mean over batch is taken in F_per_example
+        # below for shape consistency with the entropy term).
+        f_out_per_example = output_neg_log_density(y, m_z=m_h_out, v_z=v_h_out, layer=output)
+        neg_H = latent_neg_entropy(v_l)
+        F_per_example = nll_1 + output_weight * f_out_per_example + neg_H   # [B]
+        return F_per_example.mean()
+    elif net.output_likelihood == "categorical":
+        # Categorical F_out is already a batch-mean scalar (per-data-point
+        # nats); combine with the batch means of the other per-example terms.
+        f_out_mean = categorical_output_loss(net, m_l, v_l, y_idx, key, mc_samples_train)
+        neg_H = latent_neg_entropy(v_l)
+        return nll_1.mean() + output_weight * f_out_mean + neg_H.mean()
+    else:
+        raise ValueError(
+            f"unknown output_likelihood: {net.output_likelihood!r}; "
+            f"choices: 'gaussian', 'categorical'"
+        )
