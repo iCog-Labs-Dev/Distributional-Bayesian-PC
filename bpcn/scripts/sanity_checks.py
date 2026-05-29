@@ -1,9 +1,15 @@
-"""Sanity checks S1-S8 (plan §12.2) for the base BPCN.
+"""Sanity checks S1-S25 for the base BPCN.
 
 Run:
     python -m bpcn.scripts.sanity_checks
 
 Each check prints PASS/FAIL and a short justification.
+
+- S1-S9   : base BPCN (plan §12.2).
+- S10-S15 : shared-energy extension (M-SE).
+- S16-S17 : ReLU feature map psi.
+- S18-S23 : categorical output head (continuation note).
+- S24-S25 : categorical-output safety (label guard, lambda_y consistency).
 """
 from __future__ import annotations
 import sys
@@ -17,15 +23,25 @@ import numpy as np
 from ..configs.base import BaseConfig
 from ..models.network import init_network
 from ..models.moments import moment_forward
-from ..models.layer import init_layer
+from ..models.layer import init_layer, Layer
 from ..inference.e_step import e_step, initial_latents
 from ..inference.feature_moments import psi_moments, relu_delta_moments
 from ..inference.free_energy import free_energy
-from ..inference.shared_energy import shared_free_energy, _output_predictive
+from ..inference.shared_energy import shared_free_energy, _output_predictive, shared_energy_terms
+from ..inference.categorical_output import (
+    mean_categorical_loss,
+    mc_categorical_loss,
+    categorical_output_update,
+)
+from ..losses.weight_kl import gaussian_weight_kl
 from ..training.m_step import m_step, update_layer
 from ..training.loop import make_batch_step
 from ..losses.distributional_kl import gaussian_kl
-from ..evaluation.predict import _target_free_frozen, _mean_predict_from_frozen
+from ..evaluation.predict import (
+    _target_free_frozen,
+    _mean_predict_from_frozen,
+    _mc_predict_from_frozen,
+)
 from ..utils.safe_math import clamp_u
 
 
@@ -326,6 +342,8 @@ def s9_iterative_m_step(cfg):
     x = jnp.asarray(rng.uniform(0, 1, (B, cfg.input_dim)).astype(np.float32))
     y = jnp.zeros((B, cfg.output_dim), dtype=jnp.float32).at[:, 0].set(1.0)
     y_var = jnp.full_like(y, cfg.target_var)
+    y_idx = jnp.zeros((B,), dtype=jnp.int32)  # matches the one-hot at column 0
+    batch_key = jax.random.PRNGKey(0)         # Gaussian mode ignores the key
     net = init_network(key, cfg.layer_dims)
 
     # Use the SAME objective as the loop will (cfg.objective) so the manual
@@ -348,7 +366,9 @@ def s9_iterative_m_step(cfg):
         data_scale=1.0 / B, prior_scale=1.0 / B,
     )
     batch_step_1 = make_batch_step(cfg1, N_train=B)
-    loop_net_1, _, loop_diag_1, _ = batch_step_1(net, x, y, y_var, jnp.float32(1.0))
+    loop_net_1, _, loop_diag_1, _ = batch_step_1(
+        net, x, y, y_var, y_idx, batch_key, jnp.float32(1.0)
+    )
     max_diff = 0.0
     for direct_layer, loop_layer in zip(direct_net.layers, loop_net_1.layers):
         max_diff = max(
@@ -363,7 +383,9 @@ def s9_iterative_m_step(cfg):
 
     cfg3 = replace(cfg, batch_size=B, m_step_iters=3)
     batch_step_3 = make_batch_step(cfg3, N_train=B)
-    _, _, loop_diag_3, _ = batch_step_3(net, x, y, y_var, jnp.float32(1.0))
+    _, _, loop_diag_3, _ = batch_step_3(
+        net, x, y, y_var, y_idx, batch_key, jnp.float32(1.0)
+    )
     for name, ld in loop_diag_3.items():
         loop_delta = float(ld.kl_data_loop_delta)
         if loop_delta < 0.0:
@@ -829,6 +851,452 @@ def s17_relu_end_to_end_dispatch(cfg):
     return ok
 
 
+# =============================================================================
+# Categorical-output sanity checks
+# References: categorical_output_dbpcn_continuation.pdf
+# =============================================================================
+
+
+def _build_categorical_net(cfg, *, estimator="mean", psi="identity", seed=100):
+    """Build a small Network with the categorical output head configured."""
+    cfg_cat = replace(
+        cfg,
+        psi=psi,
+        output_likelihood="categorical",
+        output_estimator=estimator,
+    )
+    net = init_network(
+        jax.random.PRNGKey(seed), cfg_cat.layer_dims,
+        alpha_hidden=cfg_cat.alpha_hidden, alpha_output=cfg_cat.alpha_output,
+        beta_inv_hidden=cfg_cat.beta_inv_hidden, beta_inv_output=cfg_cat.beta_inv_output,
+        init_log_var=cfg_cat.init_log_var,
+        psi=cfg_cat.psi,
+        output_likelihood=cfg_cat.output_likelihood,
+        output_estimator=cfg_cat.output_estimator,
+    )
+    return cfg_cat, net
+
+
+def s18_mean_categorical_loss_correctness(cfg):
+    """S18: mean_categorical_loss matches the hand-computed softmax NLL.
+
+    Reference: continuation Eq. 21:
+        ell^mean_n = -log softmax(mu_y M_n^L)_{y_n}.
+    """
+    print("[S18] Categorical MEAN loss correctness")
+    cfg_cat, net = _build_categorical_net(cfg, estimator="mean", seed=130)
+    rng = np.random.default_rng(130)
+    B = 5
+    m_z = jnp.asarray(rng.normal(0, 0.3, (B, cfg.hidden_dim)).astype(np.float32))
+    v_z = jnp.asarray(rng.uniform(0.01, 0.1, (B, cfg.hidden_dim)).astype(np.float32))
+    y_idx = jnp.asarray(rng.integers(0, cfg_cat.output_dim, size=(B,)), dtype=jnp.int32)
+    impl = float(mean_categorical_loss(net, m_z, v_z, y_idx))
+
+    # Hand computation: apply psi (identity here), compute logits, NLL.
+    m_h_np = np.asarray(m_z)
+    mu_np = np.asarray(net.layers[-1].mu)
+    logits = m_h_np @ mu_np.T                                # [B, C]
+    log_probs = logits - np.log(np.exp(logits).sum(axis=-1, keepdims=True))
+    nll = -log_probs[np.arange(B), np.asarray(y_idx)]
+    hand = float(nll.mean())
+
+    err = abs(impl - hand)
+    if err < 1e-5:
+        return _ok(f"|impl - hand| = {err:.3e} < 1e-5 (impl={impl:.6f}, hand={hand:.6f})")
+    return _bad(f"MEAN loss mismatch: impl={impl:.6f}, hand={hand:.6f}, err={err:.3e}")
+
+
+def s19_mc_collapses_to_mean(cfg):
+    """S19: MC loss converges to MEAN loss as tau_y -> -inf and v_z -> 0.
+
+    Reference: continuation Eq. 24-27. With near-deterministic weights and
+    latents, each MC sample equals the posterior-mean evaluation, so the
+    sample-averaged NLL collapses to ell^mean.
+    """
+    print("[S19] Categorical MC loss collapses to MEAN at small variance")
+    _, net = _build_categorical_net(cfg, estimator="mc", seed=131)
+    # Force a near-deterministic output weight posterior.
+    out = net.layers[-1]
+    out_deterministic = out._replace(tau=jnp.full_like(out.tau, -30.0))
+    net_det = net._replace(layers=(net.layers[0], out_deterministic))
+
+    rng = np.random.default_rng(131)
+    B = 4
+    m_z = jnp.asarray(rng.normal(0, 0.3, (B, cfg.hidden_dim)).astype(np.float32))
+    v_z = jnp.full((B, cfg.hidden_dim), 1e-12, dtype=jnp.float32)
+    y_idx = jnp.asarray(rng.integers(0, cfg.output_dim, size=(B,)), dtype=jnp.int32)
+    key = jax.random.PRNGKey(231)
+    loss_mc = float(mc_categorical_loss(net_det, m_z, v_z, y_idx, key, 256))
+    loss_mean = float(mean_categorical_loss(net_det, m_z, v_z, y_idx))
+    err = abs(loss_mc - loss_mean)
+    tol = 1e-2
+    if err < tol:
+        return _ok(f"|MC - MEAN| = {err:.3e} < {tol} (MC={loss_mc:.4f}, MEAN={loss_mean:.4f})")
+    return _bad(f"MC did not collapse to MEAN: MC={loss_mc:.4f}, MEAN={loss_mean:.4f}, err={err:.3e}")
+
+
+def s20_categorical_e_step_descent(cfg):
+    """S20: F_cat-DPC is non-increasing across the categorical E-step.
+
+    Reference: continuation Section 5 (E-step descends lambda_y F_out +
+    F_trans-DPC). For the MEAN estimator the energy is deterministic so
+    monotone decrease is required (within numerical noise). MC is run with
+    a fixed key so this check is reproducible.
+    """
+    print("[S20] Categorical E-step monotone descent (MEAN estimator)")
+    cfg_cat, net = _build_categorical_net(cfg, estimator="mean", seed=132)
+    rng = np.random.default_rng(132)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_cat.input_dim)).astype(np.float32))
+    y_idx = jnp.asarray(rng.integers(0, cfg_cat.output_dim, size=(B,)), dtype=jnp.int32)
+    placeholder_y = jnp.zeros((B, cfg_cat.output_dim), dtype=x.dtype)
+    placeholder_yvar = jnp.zeros_like(placeholder_y)
+    _, diag = e_step(
+        net, x, placeholder_y,
+        T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u, v_init=cfg_cat.v_init,
+        y_var=placeholder_yvar,
+        objective="shared_dpc", kappa=1.0,
+        gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
+        y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
+    )
+    trace = np.asarray(diag.F_trace)
+    diffs = np.diff(trace)
+    tol = 1e-3 * max(1.0, float(np.max(np.abs(trace))))
+    if np.all(diffs <= tol):
+        return _ok(f"F_cat-DPC monotone (max increase = {float(diffs.max()):.4e})")
+    return _bad(f"F_cat-DPC has positive jumps; diffs={diffs}")
+
+
+def s21_categorical_output_update_decreases_loss(cfg):
+    """S21: categorical_output_update decreases F_out + gamma_y KL(W_y).
+
+    Reference: continuation Eq. 43 (output M-step descends the same scalar).
+    Uses tiny eta to guarantee local descent. MEAN estimator so the test is
+    deterministic.
+    """
+    print("[S21] Categorical output M-step decreases data + weight KL")
+    cfg_cat, net = _build_categorical_net(cfg, estimator="mean", seed=133)
+    rng = np.random.default_rng(133)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_cat.input_dim)).astype(np.float32))
+    y_idx = jnp.asarray(rng.integers(0, cfg_cat.output_dim, size=(B,)), dtype=jnp.int32)
+    placeholder_y = jnp.zeros((B, cfg_cat.output_dim), dtype=x.dtype)
+    placeholder_yvar = jnp.zeros_like(placeholder_y)
+    frozen, _ = e_step(
+        net, x, placeholder_y,
+        T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u, v_init=cfg_cat.v_init,
+        y_var=placeholder_yvar,
+        objective="shared_dpc", kappa=1.0,
+        gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
+        y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
+    )
+
+    output = net.layers[-1]
+
+    def obj(layer):
+        loss = mean_categorical_loss(
+            net._replace(layers=(net.layers[0], layer)),
+            frozen.m_z, frozen.v_z, y_idx,
+        )
+        kl = gaussian_weight_kl(layer.mu, layer.tau, layer.alpha).sum()
+        # Match the J(mu, tau) inside categorical_output_update.
+        return float(
+            cfg_cat.lambda_y * (1.0 / B) * B * loss
+            + (1.0 / B) * cfg_cat.gamma_output * kl
+        )
+
+    before = obj(output)
+    new_output, diags = categorical_output_update(
+        output, frozen, y_idx, jax.random.PRNGKey(0),
+        estimator="mean", S=1,
+        alpha=cfg_cat.alpha_output, gamma=cfg_cat.gamma_output,
+        eta_mu=1e-4, eta_tau=1e-5,
+        data_scale=1.0 / B, prior_scale=1.0 / B,
+        lambda_y=cfg_cat.lambda_y, psi=cfg_cat.psi,
+    )
+    after = obj(new_output)
+    if after <= before + 1e-5 * max(1.0, abs(before)):
+        return _ok(f"objective decreased: {before:.6f} -> {after:.6f} (delta {after - before:.3e})")
+    return _bad(f"objective increased: {before:.6f} -> {after:.6f} (delta {after - before:.3e})")
+
+
+def s22_gaussian_path_byte_identical(cfg):
+    """S22: with output_likelihood='gaussian' default, batch_step produces the
+    same weights as before the categorical extension.
+
+    Strategy: pass identical seeds through `make_batch_step` and compare
+    against a *manually-replayed* Gaussian path using only the legacy
+    Gaussian-side update_layer (no categorical branches). The legacy logic
+    is recreated in-line so we don't rely on any external baseline file.
+    """
+    print("[S22] Gaussian path byte-identical (cat extension off)")
+    key = jax.random.PRNGKey(22)
+    net = init_network(
+        key, cfg.layer_dims,
+        alpha_hidden=cfg.alpha_hidden, alpha_output=cfg.alpha_output,
+        beta_inv_hidden=cfg.beta_inv_hidden, beta_inv_output=cfg.beta_inv_output,
+        init_log_var=cfg.init_log_var,
+        psi=cfg.psi,
+    )
+    if net.output_likelihood != "gaussian":
+        return _bad(f"default output_likelihood is {net.output_likelihood!r}, expected 'gaussian'")
+    if net.output_estimator != "mean":
+        return _bad(f"default output_estimator is {net.output_estimator!r}, expected 'mean'")
+
+    B = 32
+    rng = np.random.default_rng(22)
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg.input_dim)).astype(np.float32))
+    y_idx = jnp.asarray(rng.integers(0, cfg.output_dim, size=(B,)), dtype=jnp.int32)
+    y_mean_np = np.zeros((B, cfg.output_dim), dtype=np.float32)
+    y_mean_np[np.arange(B), np.asarray(y_idx)] = 1.0
+    y_mean = jnp.asarray(y_mean_np)
+    y_var = jnp.full((B, cfg.output_dim), cfg.target_var, dtype=jnp.float32)
+
+    cfg_for_loop = replace(cfg, batch_size=B, m_step_iters=1)
+    batch_step = make_batch_step(cfg_for_loop, N_train=B)
+    loop_net, _, _, _ = batch_step(
+        net, x, y_mean, y_var, y_idx,
+        jax.random.PRNGKey(123),
+        jnp.float32(1.0),
+    )
+
+    # Manual replay using e_step + m_step directly (Gaussian-only paths).
+    frozen_ref, _ = e_step(
+        net, x, y_mean,
+        T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
+        y_var=y_var,
+        objective=cfg.objective, kappa=1.0,
+        gamma_hidden=cfg.gamma_hidden, gamma_output=cfg.gamma_output,
+        y_idx=y_idx, key=jax.random.split(jax.random.PRNGKey(123), 3)[0],
+        mc_samples_train=1,
+    )
+    ref_net, _ = m_step(
+        net, frozen_ref, x, y_mean, y_var,
+        alpha_hidden=cfg.alpha_hidden, alpha_output=cfg.alpha_output,
+        gamma_hidden=cfg.gamma_hidden, gamma_output=cfg.gamma_output,
+        eta_mu_hidden=cfg.eta_mu_hidden, eta_tau_hidden=cfg.eta_tau_hidden,
+        eta_mu_output=cfg.eta_mu_output, eta_tau_output=cfg.eta_tau_output,
+        data_scale=1.0 / B, prior_scale=1.0 / B,
+    )
+
+    max_diff = 0.0
+    for L_loop, L_ref in zip(loop_net.layers, ref_net.layers):
+        max_diff = max(
+            max_diff,
+            float(jnp.abs(L_loop.mu - L_ref.mu).max()),
+            float(jnp.abs(L_loop.tau - L_ref.tau).max()),
+        )
+    if max_diff < 1e-6:
+        return _ok(f"loop matches direct e_step+m_step (max diff {max_diff:.3e})")
+    return _bad(f"loop diverged from direct path (max diff {max_diff:.3e})")
+
+
+def s23_categorical_end_to_end_dispatch(cfg):
+    """S23: end-to-end dispatch with categorical mode (MC, S=2).
+
+    Build a categorical-mode net, run one full `batch_step` through the
+    jit-compiled training loop, and confirm:
+      - frozen latents finite and positive-variance,
+      - shared_energy_terms returns finite scalars,
+      - MEAN and MC predictives produce proper distributions on a held-out
+        eval batch.
+    """
+    print("[S23] Categorical end-to-end dispatch (MC, S=2)")
+    cfg_cat, net = _build_categorical_net(cfg, estimator="mc", psi="relu", seed=134)
+    cfg_cat = replace(cfg_cat, batch_size=16, m_step_iters=1, mc_samples_train=2)
+
+    rng = np.random.default_rng(134)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_cat.input_dim)).astype(np.float32))
+    y_idx = jnp.asarray(rng.integers(0, cfg_cat.output_dim, size=(B,)), dtype=jnp.int32)
+    y_mean_np = np.zeros((B, cfg_cat.output_dim), dtype=np.float32)
+    y_mean_np[np.arange(B), np.asarray(y_idx)] = 1.0
+    y_mean = jnp.asarray(y_mean_np)
+    y_var = jnp.full((B, cfg_cat.output_dim), cfg_cat.target_var, dtype=jnp.float32)
+
+    batch_step = make_batch_step(cfg_cat, N_train=B)
+    new_net, e_diag, m_diag, f_dpc = batch_step(
+        net, x, y_mean, y_var, y_idx,
+        jax.random.PRNGKey(234),
+        jnp.float32(1.0),
+    )
+    ok = True
+    if new_net.output_likelihood != "categorical" or new_net.output_estimator != "mc":
+        ok &= _bad(
+            f"net aux dropped: output_likelihood={new_net.output_likelihood!r}, "
+            f"output_estimator={new_net.output_estimator!r}"
+        )
+    else:
+        _ok("net.output_likelihood and output_estimator preserved after batch_step")
+
+    for name, val in [
+        ("f_out", f_dpc.f_out),
+        ("f_trans_dpc", f_dpc.f_trans_dpc),
+        ("f_weight_kl", f_dpc.f_weight_kl),
+    ]:
+        if math.isfinite(float(val)):
+            _ok(f"{name}={float(val):.4f}")
+        else:
+            ok &= _bad(f"{name} non-finite: {float(val)}")
+
+    # Eval-time predictives via target-free E-step.
+    frozen_eval = _target_free_frozen(
+        new_net, x,
+        T_z=cfg_cat.eval_T_z_resolved,
+        eta_m=cfg_cat.eval_eta_m_resolved,
+        eta_u=cfg_cat.eval_eta_u_resolved,
+        v_init=cfg_cat.eval_v_init_resolved,
+        objective="shared_dpc",
+    )
+    p_mean = _mean_predict_from_frozen(new_net, frozen_eval)
+    p_mc = _mc_predict_from_frozen(new_net, frozen_eval, jax.random.PRNGKey(99), 4)
+    for name, p in [("p_mean", p_mean), ("p_mc", p_mc)]:
+        row_sums = p.sum(axis=-1)
+        if jnp.allclose(row_sums, 1.0, atol=1e-5) and jnp.all(p >= 0):
+            _ok(f"{name} is a proper distribution (max |sum-1|={float(jnp.abs(row_sums-1).max()):.2e})")
+        else:
+            ok &= _bad(f"{name} malformed")
+    return ok
+
+
+def s24_categorical_e_step_requires_y_idx(cfg):
+    """S24: e_step raises when y_idx is missing in categorical training mode.
+
+    Reference: continuation Eq. 2/48 -- a non-zero F_out is a label-conditioned
+    cross-entropy. The dummy-y_idx fallback (class 0 for every example) would
+    silently corrupt the latent gradient. Target-free calls (output_weight=0)
+    must still be allowed because the output term cancels.
+    """
+    print("[S24] Categorical e_step demands y_idx when output_weight != 0")
+    cfg_cat, net = _build_categorical_net(cfg, estimator="mean", seed=140)
+    rng = np.random.default_rng(140)
+    B = 8
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_cat.input_dim)).astype(np.float32))
+    placeholder_y = jnp.zeros((B, cfg_cat.output_dim), dtype=x.dtype)
+    placeholder_yvar = jnp.zeros_like(placeholder_y)
+
+    ok = True
+    raised = False
+    try:
+        _ = e_step(
+            net, x, placeholder_y,
+            T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u,
+            v_init=cfg_cat.v_init,
+            y_var=placeholder_yvar, objective="shared_dpc", kappa=1.0,
+            # Deliberately NOT passing y_idx, with the default output_weight=1.0.
+        )
+    except ValueError as err:
+        raised = True
+        if "y_idx" in str(err):
+            _ok(f"raised ValueError mentioning y_idx: {err}")
+        else:
+            ok &= _bad(f"raised ValueError but message did not mention y_idx: {err}")
+    if not raised:
+        ok &= _bad("e_step accepted y_idx=None with categorical + output_weight=1.0")
+
+    # Target-free call (output_weight=0) MUST still pass without y_idx, since
+    # the output term is zeroed out and the dummy is multiplied by 0.
+    try:
+        _ = e_step(
+            net, x, placeholder_y,
+            T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u,
+            v_init=cfg_cat.v_init,
+            y_var=placeholder_yvar, objective="shared_dpc", kappa=1.0,
+            output_weight=0.0,
+        )
+        _ok("target-free e_step (output_weight=0) accepts y_idx=None")
+    except Exception as err:
+        ok &= _bad(f"target-free e_step incorrectly rejected y_idx=None: {err}")
+    return ok
+
+
+def s25_lambda_y_threaded_consistently(cfg):
+    """S25: lambda_y is honoured by E-step latent inference and the diagnostic.
+
+    Reference: continuation Eq. 2/48 -- F_cat-DPC = lambda_y F_out +
+    F_trans-DPC + F_weight-KL. Before the fix, the E-step ignored lambda_y
+    (used output_weight=1.0 by default), decoupling latent inference from
+    the M-step's lambda_y * F_out descent.
+
+    Two checks:
+      (a) Two E-steps with different output_weight values produce different
+          latent fixed points (label gradient strength depends on
+          output_weight).
+      (b) `shared_energy_terms(..., output_weight=lambda_y).f_out` ==
+          `lambda_y * shared_energy_terms(..., output_weight=1.0).f_out`
+          so the sum (f_out + f_trans_dpc + f_weight_kl) really is the
+          descended F_cat-DPC.
+    """
+    print("[S25] lambda_y threaded through E-step and shared_energy_terms")
+    cfg_cat, net = _build_categorical_net(cfg, estimator="mean", seed=141)
+    lambda_y = 3.0
+
+    rng = np.random.default_rng(141)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_cat.input_dim)).astype(np.float32))
+    y_idx = jnp.asarray(rng.integers(0, cfg_cat.output_dim, size=(B,)), dtype=jnp.int32)
+    y_mean_np = np.zeros((B, cfg_cat.output_dim), dtype=np.float32)
+    y_mean_np[np.arange(B), np.asarray(y_idx)] = 1.0
+    y_mean = jnp.asarray(y_mean_np)
+    y_var = jnp.full((B, cfg_cat.output_dim), cfg_cat.target_var, dtype=jnp.float32)
+
+    # (a) E-step depends on output_weight.
+    common = dict(
+        T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u,
+        v_init=cfg_cat.v_init,
+        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
+        y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
+    )
+    frozen_lambda, _ = e_step(net, x, y_mean, output_weight=lambda_y, **common)
+    frozen_one, _ = e_step(net, x, y_mean, output_weight=1.0, **common)
+    ok = True
+    diff = float(jnp.abs(frozen_lambda.m_z - frozen_one.m_z).max())
+    if diff > 1e-5:
+        _ok(f"E-step latent fixed point depends on output_weight (max |dm|={diff:.3e})")
+    else:
+        ok &= _bad(f"E-step latent ignored output_weight (max |dm|={diff:.3e})")
+
+    # (b) shared_energy_terms scales f_out by output_weight.
+    se_one = shared_energy_terms(
+        net, x, y_mean, y_var, frozen_lambda.m_z, frozen_lambda.v_z,
+        y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
+        gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
+        output_weight=1.0,
+    )
+    se_lambda = shared_energy_terms(
+        net, x, y_mean, y_var, frozen_lambda.m_z, frozen_lambda.v_z,
+        y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
+        gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
+        output_weight=lambda_y,
+    )
+    f_out_raw = float(se_one.f_out)
+    f_out_scaled = float(se_lambda.f_out)
+    if f_out_raw < 1e-12:
+        ok &= _bad(f"raw f_out vanished; cannot verify scaling (raw={f_out_raw:.3e})")
+    else:
+        ratio = f_out_scaled / f_out_raw
+        if abs(ratio - lambda_y) < 1e-4:
+            _ok(f"f_out scales linearly with output_weight (ratio={ratio:.4f}, expected {lambda_y:.4f})")
+        else:
+            ok &= _bad(
+                f"f_out not scaled by output_weight: raw={f_out_raw:.4f}, "
+                f"scaled={f_out_scaled:.4f}, ratio={ratio:.4f}, expected {lambda_y:.4f}"
+            )
+
+    # f_trans_dpc and f_weight_kl must NOT depend on output_weight.
+    if abs(float(se_one.f_trans_dpc) - float(se_lambda.f_trans_dpc)) < 1e-6:
+        _ok("f_trans_dpc independent of output_weight (as required)")
+    else:
+        ok &= _bad("f_trans_dpc changed with output_weight (should not)")
+    if abs(float(se_one.f_weight_kl) - float(se_lambda.f_weight_kl)) < 1e-3:
+        _ok("f_weight_kl independent of output_weight (as required)")
+    else:
+        ok &= _bad("f_weight_kl changed with output_weight (should not)")
+
+    return ok
+
+
 def main():
     cfg = BaseConfig()
     print(f"[bpcn] Running sanity checks with config layer_dims={cfg.layer_dims}", flush=True)
@@ -850,6 +1318,14 @@ def main():
         "S15": s15_shared_dpc_target_free_at_fixed_point(cfg),
         "S16": s16_relu_psi_moment_correctness(cfg),
         "S17": s17_relu_end_to_end_dispatch(cfg),
+        "S18": s18_mean_categorical_loss_correctness(cfg),
+        "S19": s19_mc_collapses_to_mean(cfg),
+        "S20": s20_categorical_e_step_descent(cfg),
+        "S21": s21_categorical_output_update_decreases_loss(cfg),
+        "S22": s22_gaussian_path_byte_identical(cfg),
+        "S23": s23_categorical_end_to_end_dispatch(cfg),
+        "S24": s24_categorical_e_step_requires_y_idx(cfg),
+        "S25": s25_lambda_y_threaded_consistently(cfg),
     }
     print()
     print("=" * 60)

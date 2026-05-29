@@ -1,0 +1,4 @@
+jax[cuda13]
+numpy
+pandas
+scikit-learn
