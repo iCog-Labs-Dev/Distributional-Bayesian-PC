@@ -77,6 +77,39 @@ def _positive_float(s: str) -> float:
     return v
 
 
+def _parse_int_list(s: str):
+    """Parse '256,128,64' -> (256, 128, 64). Used for --hidden-dims."""
+    parts = [c.strip() for c in s.split(",") if c.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("comma-separated list must be non-empty")
+    out = []
+    for p in parts:
+        try:
+            v = int(p)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"could not parse {p!r} as int")
+        if v < 1:
+            raise argparse.ArgumentTypeError(f"each entry must be >= 1, got {v}")
+        out.append(v)
+    return tuple(out)
+
+
+_ALLOWED_ACTIVATIONS = ("identity", "relu", "leaky_relu", "tanh")
+
+
+def _parse_activations(s: str):
+    """Parse 'relu,tanh' -> ('relu', 'tanh'). Used for --activations."""
+    parts = [c.strip() for c in s.split(",") if c.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("--activations must be non-empty")
+    for p in parts:
+        if p not in _ALLOWED_ACTIVATIONS:
+            raise argparse.ArgumentTypeError(
+                f"each activation must be one of {_ALLOWED_ACTIVATIONS}, got {p!r}"
+            )
+    return tuple(parts)
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="experiments.mnist",
@@ -104,10 +137,18 @@ def parse_args(argv=None):
         help="Input dim d_0 (Eq. 20; 784 for flattened MNIST).")
     g_net.add_argument(
         "--hidden-dim", type=int, default=None,
-        help="Hidden latent dim d_1 (Eq. 22).")
+        help="(Legacy single-layer.) Hidden latent dim d_1 (Eq. 22). "
+             "Prefer --hidden-dims for multi-layer configs.")
+    g_net.add_argument(
+        "--hidden-dims", type=_parse_int_list, default=None,
+        help="Comma-separated hidden layer dims for multi-layer DBPCN. "
+             "E.g. '256,128' builds L_hidden=2 with widths d_1=256, d_2=128. "
+             "Length must equal --activations length. Overrides --hidden-dim "
+             "when both are passed.")
     g_net.add_argument(
         "--hidden-init", type=str, default=None, choices=["xavier", "he"],
-        help="Init scaling kappa_1 for hidden weights (Eq. 98).")
+        help="Init scaling kappa_l for hidden weights (Eq. 98). Shared across "
+             "all hidden layers.")
     g_net.add_argument(
         "--output-init", type=str, default=None, choices=["xavier", "he"],
         help="Init scaling kappa_y for output weights (Eq. 98).")
@@ -115,10 +156,15 @@ def parse_args(argv=None):
         "--init-log-var", type=float, default=None,
         help="Initial tau = log sigma_0^2 (Eq. 99, Section 8.1).")
     g_net.add_argument(
-        "--psi", type=str, default=None, choices=["identity", "relu"],
-        help="Feature map between hidden latent z^1 and the output layer's "
-             "presynaptic input (Section 4.5). 'identity' = linear base; "
-             "'relu' = delta-method ReLU moment propagation.")
+        "--psi", type=str, default=None,
+        choices=["identity", "relu", "leaky_relu", "tanh"],
+        help="(Legacy single-layer.) Activation between the one hidden latent "
+             "and the output (Section 4.5). Prefer --activations for multi-layer.")
+    g_net.add_argument(
+        "--activations", type=_parse_activations, default=None,
+        help="Comma-separated per-layer activations psi_l. Length must equal "
+             "L_hidden (= len(--hidden-dims)). Each entry is one of "
+             "{identity, relu, leaky_relu, tanh}. E.g. 'relu,tanh' for L=2.")
 
     g_prior = p.add_argument_group("priors and residual variance (A4, A9; Eqs. 24, 27)")
     g_prior.add_argument(
@@ -300,8 +346,8 @@ def parse_args(argv=None):
 # to snake_case dest; T_z is the one exception (preserves the write-up symbol).
 _CFG_FIELDS = (
     "classes", "batch_size",
-    "input_dim", "hidden_dim", "hidden_init", "output_init", "init_log_var",
-    "psi",
+    "input_dim", "hidden_dim", "hidden_dims", "hidden_init", "output_init", "init_log_var",
+    "psi", "activations",
     "alpha_hidden", "alpha_output", "beta_inv_hidden", "beta_inv_output",
     "T_z", "eta_m", "eta_u", "v_init",
     "eta_mu_hidden", "eta_tau_hidden", "eta_mu_output", "eta_tau_output",
@@ -336,6 +382,26 @@ def build_config(args) -> BaseConfig:
         if f == "accept_or_damp" and not val:
             continue
         overrides[f] = val
+    # Promote legacy single-layer CLI flags to the canonical multi-layer
+    # tuple form *before* `dataclasses.replace`. Without this, replacing a
+    # default-constructed BaseConfig (which has already populated
+    # `hidden_dims=(128,)` / `activations=("identity",)` in __post_init__)
+    # with only `--hidden-dim 64` / `--psi relu` would leave the tuple fields
+    # at their derived defaults -- the legacy CLI flags would be silently
+    # ignored. We refuse to combine legacy and canonical for the same axis
+    # to avoid ambiguous precedence (e.g. `--hidden-dim 64 --hidden-dims 256`).
+    if "hidden_dim" in overrides and "hidden_dims" not in overrides:
+        overrides["hidden_dims"] = (int(overrides["hidden_dim"]),)
+    elif "hidden_dim" in overrides and "hidden_dims" in overrides:
+        raise argparse.ArgumentTypeError(
+            "Pass either --hidden-dim (legacy) or --hidden-dims (multi-layer), not both."
+        )
+    if "psi" in overrides and "activations" not in overrides:
+        overrides["activations"] = (overrides["psi"],)
+    elif "psi" in overrides and "activations" in overrides:
+        raise argparse.ArgumentTypeError(
+            "Pass either --psi (legacy) or --activations (multi-layer), not both."
+        )
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
     return cfg
@@ -393,7 +459,7 @@ def run(
             init_log_var=cfg.init_log_var,
             hidden_init=cfg.hidden_init,
             output_init=cfg.output_init,
-            psi=cfg.psi,
+            activations=cfg.activations,
             output_likelihood=cfg.output_likelihood,
             output_estimator=cfg.output_estimator,
         )
@@ -486,8 +552,9 @@ def run(
                 gamma_output=cfg.gamma_output,
             )
             # Variance decomposition of the OUTPUT layer's predictive uses
-            # the post-psi presynaptic moments (Section 4.5).
-            m_h_vd, v_h_vd = psi_moments(cfg.psi, frozen.m_z, frozen.v_z)
+            # the post-psi_L presynaptic moments (v2 Section 4.5; the top-
+            # latent activation feeds the output head per continuation Eq. 16).
+            m_h_vd, v_h_vd = psi_moments(cfg.activations[-1], frozen.m_z, frozen.v_z)
             vd = variance_decomposition(net, m_h_vd, v_h_vd, layer_idx=-1)
             log_fn(
                 f"[bpcn.mnist] epoch {epoch} eval: "
@@ -579,7 +646,7 @@ def _load_checkpoint(cfg: BaseConfig, checkpoint_dir: str):
         init_log_var=cfg.init_log_var,
         hidden_init=cfg.hidden_init,
         output_init=cfg.output_init,
-        psi=cfg.psi,
+        activations=cfg.activations,
         output_likelihood=cfg.output_likelihood,
         output_estimator=cfg.output_estimator,
     )

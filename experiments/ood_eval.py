@@ -385,8 +385,9 @@ def main(argv=None) -> int:
         print(f"\n[ood_eval] === {run_name} ===")
         t0 = time.time()
         cfg, net = _load_run(run)
-        print(f"  cfg: classes={cfg.classes}, hidden={cfg.hidden_dim}, psi={cfg.psi}, "
-              f"output_likelihood={cfg.output_likelihood}, output_estimator={cfg.output_estimator}")
+        print(f"  cfg: classes={cfg.classes}, hidden_dims={cfg.hidden_dims}, "
+              f"activations={cfg.activations}, output_likelihood={cfg.output_likelihood}, "
+              f"output_estimator={cfg.output_estimator}")
         test = load_split(
             cfg.classes, train=False,
             seed=cfg.seed, n_train=args.n_train, n_test=args.n_test,
