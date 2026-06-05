@@ -33,13 +33,33 @@ from ..models.moments import moment_forward
 from ..losses.distributional_kl import gaussian_kl
 from .free_energy import free_energy
 from .shared_energy import shared_free_energy
+from .feature_moments import psi_moments
 from ..utils.safe_math import clamp_u
 
 
 class FrozenLatents(NamedTuple):
-    """Output of the E-step: stop-gradient-ed (mean, variance) of the hidden latent."""
-    m_z: jax.Array     # [B, d_1]
-    v_z: jax.Array     # [B, d_1]
+    """Output of the E-step: stop-gradient-ed (mean, variance) per hidden layer.
+
+    For multi-layer support the latents are carried as tuples of length
+    `L_hidden`. `m_zs[l]` and `v_zs[l]` are the frozen mean and variance of
+    hidden latent `z^{l+1}` (zero-indexed in code; matches v2 Eq. 7's
+    `z^1, ..., z^L`).
+
+    Backward-compat `.m_z` / `.v_z` properties return the top latent
+    (`m_zs[-1]` / `v_zs[-1]`) so every downstream consumer that needs only
+    the top hidden layer's posterior (predict path, output-head M-step)
+    keeps working without code change.
+    """
+    m_zs: Tuple[jax.Array, ...]    # length L_hidden, each [B, d_l]
+    v_zs: Tuple[jax.Array, ...]    # length L_hidden, each [B, d_l]
+
+    @property
+    def m_z(self) -> jax.Array:
+        return self.m_zs[-1]
+
+    @property
+    def v_z(self) -> jax.Array:
+        return self.v_zs[-1]
 
 
 class EStepDiagnostics(NamedTuple):
@@ -49,18 +69,33 @@ class EStepDiagnostics(NamedTuple):
 
 
 def initial_latents(net: Network, x, v_init: float):
-    """Initialize q(z^1) from the hidden layer predictive prior.
+    """Initialize q(z^1), ..., q(z^L) by predictive feedforward (v2 Eq. 89).
 
-    m^1 is still the posterior-mean feedforward prediction (Eq. 89). The
-    variance now uses the moment-matched predictive variance from Eqs. 60-61,
-    with v_init retained as a numerical floor rather than the actual constant
-    initialization.
+    For each layer l in 0..L_hidden-1 (code-indexed):
+      - Compute presynaptic feature moments (m_h, v_h):
+          l == 0 : (x, zeros_like(x))    # input is deterministic, v2 Eq. 94
+          l >= 1 : psi_moments(net.activations[l-1], m_prev, v_prev)
+                                          # v2 Eq. 21 / Section 4.5
+      - Compute predictive moments (m_pred, v_pred) = moment_forward(net.layers[l], m_h, v_h)
+                                          # v2 Eqs. 60-61
+      - Set m_l = m_pred (Eq. 89: feedforward mean) and
+        u_l = log(max(v_pred, v_floor)).
+    Returns tuples of length L_hidden.
     """
-    hidden = net.layers[0]
-    m, v_pred = moment_forward(hidden, x, jnp.zeros_like(x))  # [B, d_1]
-    v_floor = jnp.asarray(v_init, dtype=v_pred.dtype)
-    u = jnp.log(jnp.maximum(v_pred, v_floor))                 # log latent variance
-    return m, u
+    L_hidden = net.L_hidden
+    v_floor = jnp.asarray(v_init, dtype=x.dtype)
+    m_h, v_h = x, jnp.zeros_like(x)
+    m_list = []
+    u_list = []
+    for l in range(L_hidden):
+        m_pred, v_pred = moment_forward(net.layers[l], m_h, v_h)
+        u_pred = jnp.log(jnp.maximum(v_pred, v_floor))
+        m_list.append(m_pred)
+        u_list.append(u_pred)
+        # Prepare next layer's presynaptic feature moments via psi_l.
+        if l + 1 < L_hidden:
+            m_h, v_h = psi_moments(net.activations[l], m_pred, v_pred)
+    return tuple(m_list), tuple(u_list)
 
 
 def e_step(
@@ -169,7 +204,8 @@ def e_step(
     u_init = jax.lax.stop_gradient(u0) if use_prox else None
 
     def F_of_log_var(m, u, k):
-        v = jnp.exp(u)
+        # m, u are tuples of length L_hidden; jax.tree.map applies exp per layer.
+        v = jax.tree.map(jnp.exp, u)
         if objective == "shared_dpc":
             F = shared_free_energy(
                 W, x, y, y_var, m, v,
@@ -187,10 +223,15 @@ def e_step(
                 y_idx=y_idx, key=k, mc_samples_train=mc_samples_train,
             )
         if use_prox:
-            # Proximal latent damping (extension Eq. 65). Anchored at the
-            # feedforward initial (m_init, u_init).
-            v_init_anchor = jnp.exp(u_init)
-            prox = gaussian_kl(m_z=m, v_z=v, m_p=m_init, v_p=v_init_anchor).kl.sum(axis=-1).mean()
+            # Proximal latent damping (extension Eq. 65), summed over hidden
+            # layers. Anchored at the feedforward initial (m_init, u_init).
+            prox = jnp.zeros((), dtype=m[0].dtype)
+            for l in range(len(m)):
+                v_anchor_l = jnp.exp(u_init[l])
+                prox = prox + gaussian_kl(
+                    m_z=m[l], v_z=v[l],
+                    m_p=m_init[l], v_p=v_anchor_l,
+                ).kl.sum(axis=-1).mean()
             F = F + float(rho_z) * prox
         return F
 
@@ -199,8 +240,9 @@ def e_step(
     def step(carry, k):
         m, u = carry
         gm, gu = grad_fn(m, u, k)
-        m_new = m - eta_m * gm                              # Eq. 43 / extension Eq. 57
-        u_new = clamp_u(u - eta_u * gu)                     # Eq. 43 + Algorithm 1 step 4e
+        # Per-layer descent step on the tuple of latents (extension Eq. 57).
+        m_new = jax.tree.map(lambda mi, gmi: mi - eta_m * gmi, m, gm)
+        u_new = jax.tree.map(lambda ui, gui: clamp_u(ui - eta_u * gui), u, gu)
         F_new = F_of_log_var(m_new, u_new, k)
         return (m_new, u_new), F_new
 
@@ -211,13 +253,14 @@ def e_step(
     (m_final, u_final), F_trace = jax.lax.scan(step, (m0, u0), keys_scan, length=T_z)
     F_initial = F_of_log_var(m0, u0, keys_scan[0])
 
-    # Freeze (Eq. 49 / Eq. 92): stop_gradient + record final statistics.
-    m_z = jax.lax.stop_gradient(m_final)
-    v_z = jax.lax.stop_gradient(jnp.exp(u_final))
+    # Freeze (v2 Eq. 92 / continuation Eq. 39): stop_gradient on every layer's
+    # (mean, variance) so the M-step treats them as fixed numerical targets.
+    m_zs = tuple(jax.lax.stop_gradient(m) for m in m_final)
+    v_zs = tuple(jax.lax.stop_gradient(jnp.exp(u)) for u in u_final)
 
     diagnostics = EStepDiagnostics(
         F_trace=F_trace,
         F_initial=F_initial,
         F_final=F_trace[-1],
     )
-    return FrozenLatents(m_z=m_z, v_z=v_z), diagnostics
+    return FrozenLatents(m_zs=m_zs, v_zs=v_zs), diagnostics

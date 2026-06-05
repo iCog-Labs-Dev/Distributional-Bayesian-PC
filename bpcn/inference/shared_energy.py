@@ -59,21 +59,38 @@ class SharedEnergyTerms(NamedTuple):
     f_weight_kl: jax.Array   # scalar, Sum_l gamma_l KL(q(W_l) || p(W_l)); NO batch averaging
 
 
-def _hidden_predictive(net: Network, x):
-    """Predictive moments of the hidden transition. Eq. 94 sets v_h^0 = 0."""
-    hidden = net.layers[0]
-    return moment_forward(hidden, x, jnp.zeros_like(x))
+def _layer_presynaptic_moments(net: Network, x, m_zs, v_zs, l: int):
+    """Presynaptic feature moments (m_h, v_h) feeding into `net.layers[l]`.
+
+    For l == 0 the presynaptic is the deterministic input (v2 Eq. 94: v_h^0 = 0).
+    For l >= 1 the presynaptic is psi_{l-1}(z^l) via the delta-method
+    moment transform (v2 Eq. 21 / Section 4.5).
+    """
+    if l == 0:
+        return x, jnp.zeros_like(x)
+    return psi_moments(net.activations[l - 1], m_zs[l - 1], v_zs[l - 1])
+
+
+def _hidden_layer_predictive(net: Network, x, m_zs, v_zs, l: int):
+    """Predictive moments of hidden transition l (v2 Eqs. 60-61 / extension Eqs. 10-11).
+
+    For l == 0: predicts z^1 from x (input is deterministic).
+    For l >= 1: predicts z^{l+1} from psi_l(z^l).
+    """
+    m_h, v_h = _layer_presynaptic_moments(net, x, m_zs, v_zs, l)
+    return moment_forward(net.layers[l], m_h, v_h)
 
 
 def _output_predictive(net: Network, m_l, v_l):
-    """Predictive moments of the output transition.
+    """Predictive moments of the output transition (top latent only).
 
-    The presynaptic feature for the output layer is psi_1(z^1); moments
-    propagate via `psi_moments(net.psi, m_l, v_l)` (Eq. 93 / Section 4.5).
-    Default `psi="identity"` recovers the linear base.
+    The presynaptic feature for the output layer is psi_L(z^L); moments
+    propagate via `psi_moments(net.activations[-1], m_l, v_l)`
+    (v2 Eq. 21 / continuation Section 4). Here (m_l, v_l) are the *top*
+    hidden latent's frozen moments.
     """
-    output = net.layers[1]
-    m_h, v_h = psi_moments(net.psi, m_l, v_l)
+    output = net.layers[-1]
+    m_h, v_h = psi_moments(net.activations[-1], m_l, v_l)
     return moment_forward(output, m_h, v_h)
 
 
@@ -84,7 +101,11 @@ def _weight_kl_total(
     *,
     weight_kl_scale: float = 1.0,
 ):
-    """Sum_l gamma_l KL(q_phi_l(W_l) || p(W_l)). Constant w.r.t. latents.
+    """Sum_l gamma_l KL(q_phi_l(W_l) || p(W_l)) (extension Eq. 12 third sum).
+
+    For multi-layer support this loops over all hidden layers (one γ_hidden
+    coefficient shared per user clarification) and adds the output-layer
+    weight KL with γ_output. Constant w.r.t. latents.
 
     `weight_kl_scale` rescales the full-data weight KL to whatever convention
     the caller's data terms are written in. Default 1.0 = the extension Eq. 12
@@ -93,11 +114,14 @@ def _weight_kl_total(
     F_DPC matches the per-data-point objective the M-step's gradient
     (data_scale=1/B, prior_scale=1/N) actually descends.
     """
-    hidden = net.layers[0]
-    output = net.layers[1]
-    Kw_h = gaussian_weight_kl(hidden.mu, hidden.tau, hidden.alpha).sum()
+    L_hidden = net.L_hidden
+    Kw_hidden = jnp.zeros((), dtype=net.layers[0].mu.dtype)
+    for l in range(L_hidden):
+        layer = net.layers[l]
+        Kw_hidden = Kw_hidden + gaussian_weight_kl(layer.mu, layer.tau, layer.alpha).sum()
+    output = net.layers[-1]
     Kw_o = gaussian_weight_kl(output.mu, output.tau, output.alpha).sum()
-    return weight_kl_scale * (gamma_hidden * Kw_h + gamma_output * Kw_o)
+    return weight_kl_scale * (gamma_hidden * Kw_hidden + gamma_output * Kw_o)
 
 
 def _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train):
@@ -125,13 +149,42 @@ def _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train):
         )
 
 
+def _coerce_latent_tuples(m_l, v_l):
+    """Accept either a single array (legacy L=1 callers) or a tuple of arrays.
+
+    Multi-layer callers pass `(m_0, m_1, ...)`, length L_hidden. Legacy L=1
+    callers pass a single array; we wrap it in a 1-tuple so the rest of the
+    function can treat both uniformly. The returned tuples are always length
+    L_hidden.
+    """
+    m_zs = m_l if isinstance(m_l, tuple) else (m_l,)
+    v_zs = v_l if isinstance(v_l, tuple) else (v_l,)
+    return m_zs, v_zs
+
+
+def _trans_dpc_sum(net: Network, x, m_zs, v_zs) -> jax.Array:
+    """Sum over l = 0..L_hidden-1 of the local Gaussian inclusion KL
+    (extension Eq. 12 second sum; extension Eqs. 13-15).
+
+    Each layer contributes `KL(N(m_zs[l], v_zs[l]) || N(m_p^l, v_p^l))`
+    summed over postsynaptic units and averaged over the batch.
+    """
+    total = jnp.zeros((), dtype=m_zs[0].dtype)
+    for l in range(net.L_hidden):
+        m_p, v_p = _hidden_layer_predictive(net, x, m_zs, v_zs, l)
+        total = total + gaussian_kl(
+            m_z=m_zs[l], v_z=v_zs[l], m_p=m_p, v_p=v_p,
+        ).kl.sum(axis=-1).mean()
+    return total
+
+
 def shared_energy_terms(
     net: Network,
     x: jax.Array,
     y_mean: jax.Array,
     y_var: jax.Array,
-    m_l: jax.Array,
-    v_l: jax.Array,
+    m_l,
+    v_l,
     *,
     y_idx=None,
     key=None,
@@ -143,35 +196,30 @@ def shared_energy_terms(
 ) -> SharedEnergyTerms:
     """Return the three decomposed terms of F_DPC at kappa=1 (extension Eq. 72).
 
-    Sum of the three equals F_cat-DPC at kappa=1 with include_weight_kl=True
-    and `output_weight = lambda_y` -- i.e. exactly the scalar the M-step
-    descends. Used for diagnostics and unit tests (S10/S12).
+    For L_hidden >= 1, `f_trans_dpc` sums over all hidden layers (extension
+    Eq. 12 second sum). Sum of the three returned terms equals F_cat-DPC at
+    kappa=1 with `include_weight_kl=True` and `output_weight = lambda_y` --
+    i.e. exactly the scalar the M-step descends.
+
+    `m_l, v_l` may be either a single array (legacy L=1 callers) or a tuple
+    of length L_hidden (multi-layer). `_coerce_latent_tuples` normalises the
+    input.
 
     `output_weight` (== `lambda_y` under the categorical head, Eq. 2/48 of
     `categorical_output_dbpcn_continuation.pdf`) is folded into the returned
     `f_out` so that `f_out + f_trans_dpc + f_weight_kl` matches the descent
-    scalar even when lambda_y != 1. Default 1.0 preserves the legacy raw
-    decomposition. Pass `cfg.lambda_y` to keep the diagnostic and the
-    E-step / M-step descent aligned.
+    scalar even when lambda_y != 1. Default 1.0 preserves the raw decomposition.
 
-    `weight_kl_scale` rescales the returned `f_weight_kl` so the sum
-    (f_out + f_trans_dpc + f_weight_kl) is on a consistent scale. The data
-    terms (f_out, f_trans_dpc) are batch *means* (per-data-point scale), so
-    callers that want the per-data-point F_DPC -- the scalar the M-step's
-    gradient with data_scale=1/B, prior_scale=1/N actually descends -- should
-    pass `weight_kl_scale = 1.0 / N_train`. Default 1.0 leaves the weight KL
-    on the full-data scale of extension Eq. 12, which mixes scales when added
-    to the batch-averaged data terms and is intended only for unit tests that
-    pair it with a matched M-step (prior_scale=1).
+    `weight_kl_scale` rescales the returned `f_weight_kl` (see callers'
+    docstrings for the convention).
 
     `y_idx`, `key`, `mc_samples_train` are consumed only when
-    `net.output_likelihood == "categorical"`. Under "gaussian" they default
-    to harmless placeholders.
+    `net.output_likelihood == "categorical"`.
     """
-    assert net.L_hidden == 1, "shared_energy_terms assumes L_hidden == 1 (base BPCN)"
-    m_p1, v_p1 = _hidden_predictive(net, x)
-    f_trans_dpc = gaussian_kl(m_z=m_l, v_z=v_l, m_p=m_p1, v_p=v_p1).kl.sum(axis=-1).mean()
-    f_out_raw = _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train)
+    m_zs, v_zs = _coerce_latent_tuples(m_l, v_l)
+    f_trans_dpc = _trans_dpc_sum(net, x, m_zs, v_zs)
+    # Output term consumes the top latent only (continuation Eq. 38).
+    f_out_raw = _output_term(net, y_mean, y_var, y_idx, m_zs[-1], v_zs[-1], key, mc_samples_train)
     output_weight_arr = jnp.asarray(output_weight, dtype=f_out_raw.dtype)
     f_out = output_weight_arr * f_out_raw
     f_weight_kl = _weight_kl_total(
@@ -185,8 +233,8 @@ def shared_free_energy(
     x: jax.Array,
     y_mean: jax.Array,
     y_var: jax.Array,
-    m_l: jax.Array,
-    v_l: jax.Array,
+    m_l,
+    v_l,
     *,
     y_idx=None,
     key=None,
@@ -199,6 +247,11 @@ def shared_free_energy(
     output_weight: float = 1.0,
 ) -> jax.Array:
     """F_kappa from extension Eq. 63 at (lambda=(m_l, v_l), phi=net).
+
+    `m_l, v_l` may be either a single array (legacy L=1 callers) or a tuple
+    of length L_hidden (multi-layer). All hidden-layer terms — both the
+    shared-KL branch (extension Eq. 12) and the legacy NLL+entropy branch
+    used at kappa < 1 — sum over l = 0..L_hidden-1.
 
     Parameters
     ----------
@@ -236,24 +289,29 @@ def shared_free_energy(
         `mc_samples_train` is the static number of MC samples. The MEAN
         estimator ignores `key` and `mc_samples_train`.
     """
-    assert net.L_hidden == 1, "shared_free_energy assumes L_hidden == 1 (base BPCN)"
-    hidden = net.layers[0]
-    # Hidden transition: shared-KL form.
-    m_p1, v_p1 = _hidden_predictive(net, x)
-    K_hidden_dpc = gaussian_kl(m_z=m_l, v_z=v_l, m_p=m_p1, v_p=v_p1).kl.sum(axis=-1).mean()
-    # Hidden transition: legacy NLL + entropy form (only used at kappa<1).
-    nll_1 = transition_neg_log_density(
-        m_l, v_l, m_h=x, v_h=jnp.zeros_like(x), layer=hidden
-    ).mean()
-    neg_H = latent_neg_entropy(v_l).mean()
-    kappa_arr = jnp.asarray(kappa, dtype=m_l.dtype)
-    hidden_term = (1.0 - kappa_arr) * (nll_1 + neg_H) + kappa_arr * K_hidden_dpc
+    m_zs, v_zs = _coerce_latent_tuples(m_l, v_l)
+    dtype = m_zs[0].dtype
+    # Hidden transitions: shared-KL form summed over all hidden layers
+    # (extension Eq. 12 second sum).
+    K_hidden_dpc = _trans_dpc_sum(net, x, m_zs, v_zs)
+    # Hidden transitions: legacy NLL + entropy form summed over all hidden
+    # layers (v2 Eq. 40 applied per layer). Only used at kappa < 1.
+    nll_sum = jnp.zeros((), dtype=dtype)
+    neg_H_sum = jnp.zeros((), dtype=dtype)
+    for l in range(net.L_hidden):
+        m_h, v_h = _layer_presynaptic_moments(net, x, m_zs, v_zs, l)
+        nll_sum = nll_sum + transition_neg_log_density(
+            m_zs[l], v_zs[l], m_h=m_h, v_h=v_h, layer=net.layers[l]
+        ).mean()
+        neg_H_sum = neg_H_sum + latent_neg_entropy(v_zs[l]).mean()
+    kappa_arr = jnp.asarray(kappa, dtype=dtype)
+    hidden_term = (1.0 - kappa_arr) * (nll_sum + neg_H_sum) + kappa_arr * K_hidden_dpc
     # Output boundary term: Gaussian inclusion-KL (legacy) or categorical
-    # softmax NLL (continuation Eq. 2/48). Not annealed by kappa
-    # (extension Eq. 63).
-    F_out = _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train)
+    # softmax NLL (continuation Eq. 2/48). Operates on the *top* latent only
+    # (continuation Eq. 38). Not annealed by kappa (extension Eq. 63).
+    F_out = _output_term(net, y_mean, y_var, y_idx, m_zs[-1], v_zs[-1], key, mc_samples_train)
 
-    output_weight_arr = jnp.asarray(output_weight, dtype=m_l.dtype)
+    output_weight_arr = jnp.asarray(output_weight, dtype=dtype)
     total = output_weight_arr * F_out + hidden_term
     if include_weight_kl:
         total = total + _weight_kl_total(

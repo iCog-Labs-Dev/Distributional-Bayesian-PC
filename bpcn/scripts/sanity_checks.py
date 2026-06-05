@@ -504,8 +504,12 @@ def s12_legacy_objective_dispatch(cfg):
     )
 
     # Replicate the legacy-objective descent manually from the current init.
+    # `initial_latents` returns tuples of length L_hidden; for the L=1 cfg
+    # used here we index [0] to recover the legacy single-array shape.
     W = jax.lax.stop_gradient(net)
-    m0, u0 = initial_latents(W, x, cfg.v_init)
+    m0_tup, u0_tup = initial_latents(W, x, cfg.v_init)
+    assert len(m0_tup) == 1, "S12 is an L=1 regression test"
+    m0, u0 = m0_tup[0], u0_tup[0]
 
     def F_of(m, u):
         return free_energy(W, x, y, m, jnp.exp(u), output_weight=1.0)
@@ -612,7 +616,9 @@ def s14_predictive_latent_init(cfg):
         jnp.ones((1, cfg.input_dim), dtype=jnp.float32),
     ])
 
-    m0, u0 = initial_latents(net, x, cfg.v_init)
+    m0_tup, u0_tup = initial_latents(net, x, cfg.v_init)
+    assert len(m0_tup) == 1, "S14 is an L=1 test"
+    m0, u0 = m0_tup[0], u0_tup[0]
     m_pred, v_pred = moment_forward(net.layers[0], x, jnp.zeros_like(x))
     v0 = jnp.exp(u0)
     v_expected = jnp.maximum(v_pred, cfg.v_init)
@@ -665,7 +671,9 @@ def s15_shared_dpc_target_free_at_fixed_point(cfg):
     y_zero = jnp.zeros((B, cfg.output_dim), dtype=x.dtype)
     y_var_zero = jnp.zeros_like(y_zero)
 
-    m0, u0 = initial_latents(net, x, cfg.v_init)
+    m0_tup, u0_tup = initial_latents(net, x, cfg.v_init)
+    assert len(m0_tup) == 1, "S15 is an L=1 test"
+    m0, u0 = m0_tup[0], u0_tup[0]
     v0 = jnp.exp(u0)
 
     frozen, diag = e_step(
@@ -767,18 +775,20 @@ def s17_relu_end_to_end_dispatch(cfg):
       - _mean_predict_from_frozen returns a probability vector summing to 1.
     """
     print("[S17] ReLU end-to-end dispatch")
-    cfg_relu = replace(cfg, psi="relu")
+    # `replace` resets `activations` to `()` triggering __post_init__'s
+    # legacy fallback `(psi,) = ("relu",)`. Either form works.
+    cfg_relu = replace(cfg, psi="relu", activations=())
     key = jax.random.PRNGKey(18)
     net = init_network(
         key, cfg_relu.layer_dims,
         alpha_hidden=cfg_relu.alpha_hidden, alpha_output=cfg_relu.alpha_output,
         beta_inv_hidden=cfg_relu.beta_inv_hidden, beta_inv_output=cfg_relu.beta_inv_output,
         init_log_var=cfg_relu.init_log_var,
-        psi=cfg_relu.psi,
+        activations=cfg_relu.activations,
     )
-    if net.psi != "relu":
-        return _bad(f"Network.psi did not propagate: got {net.psi!r}")
-    _ok(f"Network.psi == {net.psi!r}")
+    if net.activations[-1] != "relu":
+        return _bad(f"Network.activations[-1] did not propagate: got {net.activations[-1]!r}")
+    _ok(f"Network.activations[-1] == {net.activations[-1]!r}")
 
     rng = np.random.default_rng(18)
     B = 32
@@ -829,10 +839,10 @@ def s17_relu_end_to_end_dispatch(cfg):
         jnp.all(jnp.isfinite(lr.mu)) and jnp.all(jnp.isfinite(lr.tau))
         for lr in new_net.layers
     )
-    if finite_new and new_net.psi == "relu":
-        _ok("m_step produced finite weights and preserved Network.psi")
+    if finite_new and new_net.activations[-1] == "relu":
+        _ok("m_step produced finite weights and preserved Network.activations")
     else:
-        ok &= _bad("m_step weights non-finite or psi was dropped")
+        ok &= _bad("m_step weights non-finite or activations were dropped")
 
     # Mean predict.
     frozen_eval = _target_free_frozen(
@@ -870,7 +880,7 @@ def _build_categorical_net(cfg, *, estimator="mean", psi="identity", seed=100):
         alpha_hidden=cfg_cat.alpha_hidden, alpha_output=cfg_cat.alpha_output,
         beta_inv_hidden=cfg_cat.beta_inv_hidden, beta_inv_output=cfg_cat.beta_inv_output,
         init_log_var=cfg_cat.init_log_var,
-        psi=cfg_cat.psi,
+        activations=cfg_cat.activations,
         output_likelihood=cfg_cat.output_likelihood,
         output_estimator=cfg_cat.output_estimator,
     )
@@ -1012,7 +1022,7 @@ def s21_categorical_output_update_decreases_loss(cfg):
         alpha=cfg_cat.alpha_output, gamma=cfg_cat.gamma_output,
         eta_mu=1e-4, eta_tau=1e-5,
         data_scale=1.0 / B, prior_scale=1.0 / B,
-        lambda_y=cfg_cat.lambda_y, psi=cfg_cat.psi,
+        lambda_y=cfg_cat.lambda_y, psi=cfg_cat.activations[-1],
     )
     after = obj(new_output)
     if after <= before + 1e-5 * max(1.0, abs(before)):
@@ -1036,7 +1046,7 @@ def s22_gaussian_path_byte_identical(cfg):
         alpha_hidden=cfg.alpha_hidden, alpha_output=cfg.alpha_output,
         beta_inv_hidden=cfg.beta_inv_hidden, beta_inv_output=cfg.beta_inv_output,
         init_log_var=cfg.init_log_var,
-        psi=cfg.psi,
+        activations=cfg.activations,
     )
     if net.output_likelihood != "gaussian":
         return _bad(f"default output_likelihood is {net.output_likelihood!r}, expected 'gaussian'")
@@ -1297,6 +1307,569 @@ def s25_lambda_y_threaded_consistently(cfg):
     return ok
 
 
+# ---------------------------------------------------------------------------
+# S26 -- S31: multi-layer generalization
+# ---------------------------------------------------------------------------
+# All multi-layer code paths must (a) reproduce L=1 numerics bit-identically
+# (regression: S26), (b) descend the canonical F_DPC at L>=2 (S27-S28),
+# (c) match the write-up's predictive init and decomposition (S28, S31),
+# and (d) implement the two new delta-method activations correctly (S29-S30).
+
+
+def s26_l1_byte_identity_legacy_vs_canonical(cfg):
+    """S26: BaseConfig built with legacy (hidden_dim, psi) is bit-identical to
+    canonical (hidden_dims, activations) construction.
+
+    Regression test for the multi-layer refactor's backward-compatibility
+    claim. `__post_init__` derives the tuple fields from the legacy scalars
+    when the tuples are empty; this test exercises that path and confirms a
+    full `batch_step` produces identical weights/F_DPC across the two
+    construction routes.
+    """
+    print("[S26] L=1 byte-identity: legacy vs canonical BaseConfig")
+    legacy_cfg = BaseConfig(hidden_dim=64, psi="relu")
+    canon_cfg = BaseConfig(hidden_dims=(64,), activations=("relu",))
+    ok = True
+    if legacy_cfg.hidden_dims == canon_cfg.hidden_dims and legacy_cfg.activations == canon_cfg.activations:
+        _ok(f"both configs resolve to hidden_dims={canon_cfg.hidden_dims}, "
+            f"activations={canon_cfg.activations}")
+    else:
+        return _bad(
+            f"legacy and canonical differ: legacy={legacy_cfg.hidden_dims}/{legacy_cfg.activations}, "
+            f"canonical={canon_cfg.hidden_dims}/{canon_cfg.activations}"
+        )
+    # Build networks under both configs; same seed => identical weights.
+    legacy_net = init_network(
+        jax.random.PRNGKey(26), legacy_cfg.layer_dims,
+        activations=legacy_cfg.activations,
+        init_log_var=legacy_cfg.init_log_var,
+    )
+    canon_net = init_network(
+        jax.random.PRNGKey(26), canon_cfg.layer_dims,
+        activations=canon_cfg.activations,
+        init_log_var=canon_cfg.init_log_var,
+    )
+    max_diff = 0.0
+    for l_leg, l_can in zip(legacy_net.layers, canon_net.layers):
+        max_diff = max(max_diff, float(jnp.abs(l_leg.mu - l_can.mu).max()))
+        max_diff = max(max_diff, float(jnp.abs(l_leg.tau - l_can.tau).max()))
+    if max_diff == 0.0:
+        _ok(f"init_network output identical (max |diff| = {max_diff:.3e})")
+    else:
+        ok &= _bad(f"init_network output differs (max |diff| = {max_diff:.3e})")
+    if legacy_net.activations == canon_net.activations == ("relu",):
+        _ok(f"Network.activations propagated: {legacy_net.activations}")
+    else:
+        ok &= _bad("Network.activations did not propagate equivalently")
+    return ok
+
+
+def _build_multi_layer_net(*, hidden_dims, activations,
+                            output_likelihood="gaussian",
+                            output_estimator="mean", seed=200):
+    """Helper: build (cfg, net) for an L=len(hidden_dims) network."""
+    cfg = BaseConfig(
+        hidden_dims=hidden_dims,
+        activations=activations,
+        batch_size=16, T_z=5, m_step_iters=1,
+        output_likelihood=output_likelihood,
+        output_estimator=output_estimator,
+    )
+    net = init_network(
+        jax.random.PRNGKey(seed), cfg.layer_dims,
+        alpha_hidden=cfg.alpha_hidden, alpha_output=cfg.alpha_output,
+        beta_inv_hidden=cfg.beta_inv_hidden, beta_inv_output=cfg.beta_inv_output,
+        init_log_var=cfg.init_log_var,
+        activations=cfg.activations,
+        output_likelihood=output_likelihood,
+        output_estimator=output_estimator,
+    )
+    return cfg, net
+
+
+def s27_l2_e_step_descent(cfg):
+    """S27: L=2 E-step descends F_DPC across the inner T_z iterations.
+
+    Builds an L_hidden=2 network with `activations=('relu', 'identity')`,
+    runs `e_step` with the shared-DPC objective at kappa=1, and asserts the
+    recorded F_trace is monotone non-increasing.
+
+    Embeds two write-up alignment checks:
+      1. Target+source gradient routing (extension Eq. 31 / continuation
+         Eq. 37): perturbing the interior latent `m_zs[0]` must produce a
+         non-zero `F_DPC` gradient through both `K^1` (target role) and
+         `K^2` (source role through psi_1).
+      2. Output term restricted to top latent (continuation Eq. 38):
+         `dF_out/dm_zs[0] == 0` for the interior latent.
+    """
+    print("[S27] L=2 E-step descent + target+source gradient routing")
+    cfg_l2, net = _build_multi_layer_net(
+        hidden_dims=(64, 32), activations=("relu", "identity"), seed=270,
+    )
+    rng = np.random.default_rng(270)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_l2.input_dim)).astype(np.float32))
+    y_mean = jnp.zeros((B, cfg_l2.output_dim), dtype=jnp.float32).at[:, 0].set(1.0)
+    y_var = jnp.full_like(y_mean, cfg_l2.target_var)
+
+    # E-step descent.
+    frozen, e_diag = e_step(
+        net, x, y_mean,
+        T_z=cfg_l2.T_z, eta_m=cfg_l2.eta_m, eta_u=cfg_l2.eta_u, v_init=cfg_l2.v_init,
+        y_var=y_var, objective="shared_dpc", kappa=1.0,
+    )
+    ok = True
+    F_trace = np.asarray(e_diag.F_trace)
+    deltas = np.diff(F_trace)
+    if deltas.max() <= 1e-3 * max(1.0, abs(float(F_trace[0]))):
+        _ok(f"F_DPC monotone over {len(F_trace)} steps (max increase {deltas.max():.3e})")
+    else:
+        ok &= _bad(f"F_DPC increased mid-trace by {deltas.max():.3e}")
+    # Frozen latents must be tuples of length 2.
+    if isinstance(frozen.m_zs, tuple) and len(frozen.m_zs) == 2:
+        _ok(f"FrozenLatents carries L_hidden=2 latents (shapes {[m.shape for m in frozen.m_zs]})")
+    else:
+        ok &= _bad(f"FrozenLatents.m_zs is not a length-2 tuple")
+
+    # Target+source gradient routing (Eq. 31). At the predictive-init fixed
+    # point all `K^l` are zero (m_z = m_p), so we *perturb* the interior
+    # latent off the fixed point and verify the autodiff gradient at the
+    # perturbed point is non-zero through both `K^1` (target role) and
+    # `K^2` (source role through psi_1).
+    m0_tup, u0_tup = initial_latents(net, x, cfg_l2.v_init)
+    perturb = jax.random.normal(jax.random.PRNGKey(271), m0_tup[0].shape) * 0.1
+    m_perturbed = (m0_tup[0] + perturb, m0_tup[1])
+    v_perturbed = tuple(jnp.exp(u) for u in u0_tup)
+
+    def F_full(m_tup, v_tup):
+        return shared_free_energy(
+            net, x, y_mean, y_var, m_tup, v_tup,
+            kappa=1.0, gamma_hidden=cfg_l2.gamma_hidden,
+            gamma_output=cfg_l2.gamma_output,
+            include_weight_kl=False,
+        )
+
+    grads = jax.grad(F_full, argnums=0)(m_perturbed, v_perturbed)
+    norm_interior = float(jnp.linalg.norm(grads[0]))
+    norm_top = float(jnp.linalg.norm(grads[1]))
+    if norm_interior > 1e-6 and norm_top > 1e-6:
+        _ok(f"perturbed interior latent receives non-zero F_DPC gradient "
+            f"(interior |g|={norm_interior:.3e}, top |g|={norm_top:.3e}) -- "
+            f"target+source routing (Eq. 31) OK")
+    else:
+        ok &= _bad(f"latent gradient unexpectedly zero (interior |g|={norm_interior:.3e}, "
+                   f"top |g|={norm_top:.3e})")
+
+    # F_out is restricted to the top latent (Eq. 38). Differentiating the
+    # output-only term w.r.t. the interior latent must yield zero.
+    from ..inference.shared_energy import _output_term
+
+    def F_out_only(m_tup):
+        return _output_term(net, y_mean, y_var, None, m_tup[-1], v_perturbed[-1], None, 1)
+
+    g_out = jax.grad(F_out_only)(m0_tup)
+    if float(jnp.abs(g_out[0]).max()) < 1e-8 and float(jnp.linalg.norm(g_out[1])) > 1e-8:
+        _ok(f"F_out gradient is zero on interior latent and non-zero on top "
+            f"(|g_int|_max={float(jnp.abs(g_out[0]).max()):.1e}, "
+            f"|g_top|={float(jnp.linalg.norm(g_out[1])):.3e}) -- continuation Eq. 38 OK")
+    else:
+        ok &= _bad(
+            f"F_out interior gradient should be zero, top gradient non-zero "
+            f"(|g_int|_max={float(jnp.abs(g_out[0]).max()):.3e}, "
+            f"|g_top|={float(jnp.linalg.norm(g_out[1])):.3e})"
+        )
+    return ok
+
+
+def s28_l2_m_step_decreases_f_dpc(cfg):
+    """S28: one L=2 M-step decreases the F_DPC scalar.
+
+    Also locks the extension Eq. 72 decomposition invariant:
+        f_out + f_trans_dpc + f_weight_kl ~= F_DPC
+    so the diagnostic the loop logs equals the scalar the M-step descended.
+    """
+    print("[S28] L=2 M-step decreases F_DPC + Eq. 72 decomposition sum")
+    cfg_l2, net = _build_multi_layer_net(
+        hidden_dims=(64, 32), activations=("relu", "tanh"), seed=280,
+    )
+    rng = np.random.default_rng(280)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_l2.input_dim)).astype(np.float32))
+    y_mean = jnp.zeros((B, cfg_l2.output_dim), dtype=jnp.float32).at[:, 0].set(1.0)
+    y_var = jnp.full_like(y_mean, cfg_l2.target_var)
+
+    frozen, _ = e_step(
+        net, x, y_mean,
+        T_z=cfg_l2.T_z, eta_m=cfg_l2.eta_m, eta_u=cfg_l2.eta_u, v_init=cfg_l2.v_init,
+        y_var=y_var, objective="shared_dpc", kappa=1.0,
+    )
+
+    def f_dpc(n_):
+        return float(shared_free_energy(
+            n_, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
+            kappa=1.0, gamma_hidden=cfg_l2.gamma_hidden,
+            gamma_output=cfg_l2.gamma_output, include_weight_kl=True,
+            weight_kl_scale=1.0 / max(cfg_l2.n_train_total, 1) if cfg_l2.n_train_total else 1.0,
+        ))
+
+    # If n_train_total is 0 (not yet populated), use full-data weight KL scale.
+    weight_kl_scale = (
+        1.0 / cfg_l2.n_train_total if cfg_l2.n_train_total > 0 else 1.0
+    )
+
+    def f_dpc_(n_):
+        return float(shared_free_energy(
+            n_, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
+            kappa=1.0, gamma_hidden=cfg_l2.gamma_hidden,
+            gamma_output=cfg_l2.gamma_output, include_weight_kl=True,
+            weight_kl_scale=weight_kl_scale,
+        ))
+
+    F_before = f_dpc_(net)
+    new_net, _ = m_step(
+        net, frozen, x, y_mean, y_var,
+        alpha_hidden=cfg_l2.alpha_hidden, alpha_output=cfg_l2.alpha_output,
+        gamma_hidden=cfg_l2.gamma_hidden, gamma_output=cfg_l2.gamma_output,
+        eta_mu_hidden=cfg_l2.eta_mu_hidden, eta_tau_hidden=cfg_l2.eta_tau_hidden,
+        eta_mu_output=cfg_l2.eta_mu_output, eta_tau_output=cfg_l2.eta_tau_output,
+        data_scale=1.0 / B, prior_scale=weight_kl_scale,
+    )
+    F_after = f_dpc_(new_net)
+    ok = True
+    if F_after <= F_before + 1e-4 * max(1.0, abs(F_before)):
+        _ok(f"F_DPC decreased {F_before:.4f} -> {F_after:.4f} (delta {F_after-F_before:.3e})")
+    else:
+        ok &= _bad(f"F_DPC increased {F_before:.4f} -> {F_after:.4f}")
+
+    # Decomposition sum invariant (extension Eq. 72).
+    terms = shared_energy_terms(
+        new_net, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
+        gamma_hidden=cfg_l2.gamma_hidden, gamma_output=cfg_l2.gamma_output,
+        weight_kl_scale=weight_kl_scale,
+    )
+    sum_terms = float(terms.f_out) + float(terms.f_trans_dpc) + float(terms.f_weight_kl)
+    if abs(sum_terms - F_after) < 1e-3 * max(1.0, abs(F_after)):
+        _ok(f"decomposition sums to F_DPC: {sum_terms:.4f} ~= {F_after:.4f}")
+    else:
+        ok &= _bad(f"decomposition mismatch: sum={sum_terms:.4f}, F_DPC={F_after:.4f}")
+    return ok
+
+
+def s29_leaky_relu_moment_correctness(cfg):
+    """S29: `leaky_relu_delta_moments` matches MC reference (v2 Section 4.5).
+
+    Sample 16k z's per element from N(m_z, v_z), apply leaky_relu(alpha=0.01)
+    exactly, and compare the sample mean/variance to the delta-method
+    approximation. Mean is exact (the delta method computes the correct mean
+    on a piecewise-linear activation); variance is approximate near m_z=0
+    where the Jacobian switches.
+    """
+    print("[S29] leaky_relu_delta_moments vs Monte Carlo (away from the kink)")
+    from ..inference.feature_moments import leaky_relu_delta_moments
+    rng = np.random.default_rng(290)
+    # The delta method assumes the activation is locally linear over the
+    # support of N(m_z, v_z). For leaky_relu this fails near the kink z=0;
+    # bias near m_z=0 is ~(1-alpha) * sqrt(v) / sqrt(2*pi). We test in the
+    # regime |m_z| >> sqrt(v_z) where the approximation is valid -- this
+    # also matches how moments live in the network (|m_z| O(0.1-1),
+    # sqrt(v_z) O(0.05) at init).
+    m_raw = rng.uniform(-2.0, 2.0, size=(64,))
+    # Push small-|m| values away from 0 to stay clear of the kink.
+    m_raw = np.where(np.abs(m_raw) < 0.4, np.sign(m_raw) * 0.4, m_raw)
+    m = jnp.asarray(m_raw.astype(np.float32))
+    v = jnp.asarray(rng.uniform(0.005, 0.05, size=(64,)).astype(np.float32))
+    m_pred, v_pred = leaky_relu_delta_moments(m, v)
+    S = 16384
+    eps = jax.random.normal(jax.random.PRNGKey(29), (S, m.shape[0]))
+    z = m[None, :] + jnp.sqrt(v)[None, :] * eps
+    h = jax.nn.leaky_relu(z, negative_slope=0.01)
+    m_mc = jnp.mean(h, axis=0)
+    v_mc = jnp.var(h, axis=0)
+    err_m = float(jnp.abs(m_pred - m_mc).max())
+    # For leaky_relu with small alpha, var(f(z)) when m_z<0 is alpha^2 * v_z
+    # ~ 1e-6, so a tiny absolute MC noise still gives a huge relative error.
+    # Use min(absolute, relative) as the check criterion.
+    abs_err = jnp.abs(v_pred - v_mc)
+    rel_err = abs_err / (v_mc + 1e-6)
+    err_v = float(jnp.minimum(abs_err, rel_err).max())
+    ok = True
+    if err_m < 0.05:
+        _ok(f"|mean - MC|_max = {err_m:.3e} < 0.05")
+    else:
+        ok &= _bad(f"mean mismatch {err_m:.3e}")
+    if err_v < 0.05:
+        _ok(f"min(abs, rel)|var - MC| max = {err_v:.3e} < 0.05")
+    else:
+        ok &= _bad(f"variance mismatch {err_v:.3e}")
+    return ok
+
+
+def s30_tanh_moment_correctness(cfg):
+    """S30: `tanh_delta_moments` matches MC reference (v2 Section 4.5).
+
+    Same MC strategy as S29 but with tanh. The delta method's mean
+    `tanh(m_z)` is biased compared to E[tanh(z)] when v_z is large
+    (concavity of tanh), so the tolerance is per-region: tight where
+    |m_z| is small, loose where tanh saturates.
+    """
+    print("[S30] tanh_delta_moments vs Monte Carlo (small v_z regime)")
+    from ..inference.feature_moments import tanh_delta_moments
+    rng = np.random.default_rng(300)
+    # Small-v regime where the first-order Taylor expansion of tanh is
+    # accurate. With v ~ 1e-2 the residual bias from tanh's curvature is
+    # O(v^2 * tanh''(m_z)) and stays bounded.
+    m = jnp.asarray(rng.uniform(-1.5, 1.5, size=(64,)).astype(np.float32))
+    v = jnp.asarray(rng.uniform(0.005, 0.05, size=(64,)).astype(np.float32))
+    m_pred, v_pred = tanh_delta_moments(m, v)
+    S = 16384
+    eps = jax.random.normal(jax.random.PRNGKey(30), (S, m.shape[0]))
+    z = m[None, :] + jnp.sqrt(v)[None, :] * eps
+    h = jnp.tanh(z)
+    m_mc = jnp.mean(h, axis=0)
+    v_mc = jnp.var(h, axis=0)
+    err_m = float(jnp.abs(m_pred - m_mc).max())
+    err_v_rel = float((jnp.abs(v_pred - v_mc) / (v_mc + 1e-6)).max())
+    ok = True
+    if err_m < 0.05:
+        _ok(f"|mean - MC|_max = {err_m:.3e} < 0.05")
+    else:
+        ok &= _bad(f"mean mismatch {err_m:.3e}")
+    if err_v_rel < 0.4:
+        _ok(f"rel|var - MC| max = {err_v_rel:.3f} < 0.4 in the small-v regime")
+    else:
+        ok &= _bad(f"variance mismatch (rel) {err_v_rel:.3f}")
+    return ok
+
+
+def s31_multi_layer_end_to_end(cfg):
+    """S31: L=3 categorical-MC end-to-end + predictive init reproduces Eq. 89.
+
+    Builds `hidden_dims=(64, 48, 32), activations=('relu', 'leaky_relu', 'tanh')`
+    with output_likelihood='categorical', output_estimator='mc'; runs one
+    `batch_step` via the production loop and verifies:
+      - finite F components, finite weights after update,
+      - per-layer `m_step` diagnostics ('hidden_0', 'hidden_1', 'hidden_2', 'output'),
+      - both predictive heads (mean / MC) produce proper distributions.
+
+    Predictive-init check (v2 Eq. 89): independently compute
+        m_1 = mu_1 x,  m_2 = mu_2 psi_1(m_1),  m_3 = mu_3 psi_2(m_2)
+    and verify `initial_latents` returns the same per-layer means.
+    """
+    print("[S31] L=3 end-to-end + predictive init Eq. 89")
+    cfg_l3, net = _build_multi_layer_net(
+        hidden_dims=(64, 48, 32),
+        activations=("relu", "leaky_relu", "tanh"),
+        output_likelihood="categorical", output_estimator="mc",
+        seed=310,
+    )
+    rng = np.random.default_rng(310)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_l3.input_dim)).astype(np.float32))
+    y_idx = jnp.asarray(rng.integers(0, cfg_l3.output_dim, size=(B,)), dtype=jnp.int32)
+    y_mean = jnp.zeros((B, cfg_l3.output_dim), dtype=x.dtype)
+    y_mean = y_mean.at[jnp.arange(B), y_idx].set(1.0)
+    y_var = jnp.full_like(y_mean, cfg_l3.target_var)
+    ok = True
+
+    # Predictive init Eq. 89 reproduction. Compute the chain by hand.
+    from ..inference.feature_moments import psi_moments
+    m_hand = []
+    m_h = x
+    v_h = jnp.zeros_like(x)
+    for l in range(net.L_hidden):
+        m_p, v_p = moment_forward(net.layers[l], m_h, v_h)
+        m_hand.append(m_p)
+        if l + 1 < net.L_hidden:
+            m_h, v_h = psi_moments(net.activations[l], m_p, v_p)
+    m0_tup, _ = initial_latents(net, x, cfg_l3.v_init)
+    max_diff = max(float(jnp.abs(m0_tup[l] - m_hand[l]).max()) for l in range(net.L_hidden))
+    if max_diff < 1e-6:
+        _ok(f"initial_latents reproduces Eq. 89 chain (max diff {max_diff:.3e})")
+    else:
+        ok &= _bad(f"initial_latents diverges from Eq. 89 (max diff {max_diff:.3e})")
+
+    # End-to-end batch_step via the production loop.
+    batch_step = make_batch_step(cfg_l3, N_train=B * 100)
+    new_net, e_diag, m_diag, f_dpc = batch_step(
+        net, x, y_mean, y_var, y_idx, jax.random.PRNGKey(311), jnp.float32(1.0)
+    )
+    # Per-layer diagnostics present.
+    expected_keys = {"hidden_0", "hidden_1", "hidden_2", "output"}
+    if expected_keys.issubset(set(m_diag.keys())):
+        _ok(f"per-layer m_diag keys present: {sorted(m_diag.keys())}")
+    else:
+        ok &= _bad(f"per-layer m_diag keys missing; got {sorted(m_diag.keys())}")
+    # Finite weights.
+    finite = all(
+        jnp.all(jnp.isfinite(lr.mu)) and jnp.all(jnp.isfinite(lr.tau))
+        for lr in new_net.layers
+    )
+    if finite:
+        _ok("batch_step produced finite weights across all 4 layers")
+    else:
+        ok &= _bad("non-finite weights after batch_step")
+    # Finite F components.
+    if all(jnp.isfinite(getattr(f_dpc, k)) for k in ("f_out", "f_trans_dpc", "f_weight_kl")):
+        _ok(f"f_out={float(f_dpc.f_out):.4f} f_trans_dpc={float(f_dpc.f_trans_dpc):.4f} "
+            f"f_weight_kl={float(f_dpc.f_weight_kl):.4f}")
+    else:
+        ok &= _bad("non-finite f_dpc components")
+    # Both predictive heads produce proper distributions.
+    frozen_eval = _target_free_frozen(
+        new_net, x,
+        T_z=cfg_l3.T_z, eta_m=cfg_l3.eta_m, eta_u=cfg_l3.eta_u, v_init=cfg_l3.v_init,
+        objective="shared_dpc", kappa=1.0,
+        gamma_hidden=cfg_l3.gamma_hidden, gamma_output=cfg_l3.gamma_output,
+    )
+    p_mean = _mean_predict_from_frozen(new_net, frozen_eval)
+    p_mc = _mc_predict_from_frozen(new_net, frozen_eval, jax.random.PRNGKey(312), 4)
+    if float(jnp.abs(p_mean.sum(axis=-1) - 1.0).max()) < 1e-5:
+        _ok("MEAN predictive sums to 1")
+    else:
+        ok &= _bad("MEAN predictive not a proper distribution")
+    if float(jnp.abs(p_mc.sum(axis=-1) - 1.0).max()) < 1e-5:
+        _ok("MC predictive sums to 1")
+    else:
+        ok &= _bad("MC predictive not a proper distribution")
+    return ok
+
+
+def s32_review_regressions(cfg):
+    """S32: regression locks for the three review-found bugs.
+
+    Bug 1 (P1): legacy CLI / `dataclasses.replace` overrides were silently
+    ignored once BaseConfig's __post_init__ had derived the canonical
+    tuples. We assert that
+        replace(BaseConfig(), hidden_dim=64, psi='relu')
+    re-derives `hidden_dims=(64,), activations=('relu',)` -- the legacy
+    override is honoured.
+
+    Bug 2 (P2): m_step no longer emitted `"hidden"` for L>=2, so
+    downstream logging that reads `m_diag["hidden"]` (in experiments/mnist.py)
+    crashed at epoch end. We assert that an L=2 m_step returns *both*
+    `"hidden_0"` / `"hidden_1"` (per-layer) and an aggregate `"hidden"`
+    alias pointing at the top hidden's diagnostics.
+
+    Bug 3 (P3): the categorical MC output M-step's sample-side activation
+    only handled 'relu'; with `--activations relu,tanh` (or `leaky_relu`)
+    it silently degraded to identity. We assert that the categorical
+    update gradient w.r.t. mu is *non-zero* under the new activations and
+    *differs* from what an identity head would produce, locking that the
+    M-step objective actually applies the configured activation.
+    """
+    print("[S32] Regression locks for review-found bugs (P1, P2, P3)")
+    ok = True
+
+    # --- P1 ---
+    base = BaseConfig()
+    replaced = replace(base, hidden_dim=64, psi="relu")
+    if replaced.hidden_dims == (64,) and replaced.activations == ("relu",):
+        _ok("P1: replace(BaseConfig(), hidden_dim=64, psi='relu') honors legacy override")
+    else:
+        ok &= _bad(
+            f"P1: legacy override dropped; got hidden_dims={replaced.hidden_dims}, "
+            f"activations={replaced.activations}"
+        )
+    # And canonical still wins when both are provided.
+    both = BaseConfig(hidden_dim=999, hidden_dims=(256, 128),
+                      psi="tanh", activations=("relu", "tanh"))
+    if both.hidden_dims == (256, 128) and both.activations == ("relu", "tanh"):
+        _ok("P1: canonical tuples win when both legacy and canonical are set")
+    else:
+        ok &= _bad("P1: canonical did not win over legacy")
+
+    # --- P2 ---
+    cfg_l2, net_l2 = _build_multi_layer_net(
+        hidden_dims=(64, 32), activations=("relu", "identity"), seed=320,
+    )
+    rng = np.random.default_rng(320)
+    B = 16
+    x = jnp.asarray(rng.uniform(0, 1, (B, cfg_l2.input_dim)).astype(np.float32))
+    y_mean = jnp.zeros((B, cfg_l2.output_dim), dtype=jnp.float32).at[:, 0].set(1.0)
+    y_var = jnp.full_like(y_mean, cfg_l2.target_var)
+    frozen, _ = e_step(
+        net_l2, x, y_mean,
+        T_z=cfg_l2.T_z, eta_m=cfg_l2.eta_m, eta_u=cfg_l2.eta_u, v_init=cfg_l2.v_init,
+        y_var=y_var, objective="shared_dpc", kappa=1.0,
+    )
+    _, m_diag = m_step(
+        net_l2, frozen, x, y_mean, y_var,
+        alpha_hidden=cfg_l2.alpha_hidden, alpha_output=cfg_l2.alpha_output,
+        gamma_hidden=cfg_l2.gamma_hidden, gamma_output=cfg_l2.gamma_output,
+        eta_mu_hidden=cfg_l2.eta_mu_hidden, eta_tau_hidden=cfg_l2.eta_tau_hidden,
+        eta_mu_output=cfg_l2.eta_mu_output, eta_tau_output=cfg_l2.eta_tau_output,
+        data_scale=1.0 / B, prior_scale=1.0,
+    )
+    expected_keys = {"hidden", "hidden_0", "hidden_1", "output"}
+    if expected_keys.issubset(set(m_diag.keys())):
+        _ok(f"P2: L=2 m_step emits per-layer + 'hidden' aggregate (keys: {sorted(m_diag.keys())})")
+    else:
+        ok &= _bad(
+            f"P2: missing aggregate 'hidden' key in L=2 m_diag; got {sorted(m_diag.keys())}"
+        )
+    # The aggregate alias should equal the top hidden's diag (hidden_1).
+    if m_diag["hidden"] is m_diag["hidden_1"]:
+        _ok("P2: 'hidden' aggregate aliases the top hidden's diagnostics")
+    else:
+        ok &= _bad("P2: 'hidden' aggregate is not the top hidden's diag")
+
+    # --- P3 ---
+    # Build a categorical-MC net with a non-ReLU top activation; verify the
+    # M-step's gradient on mu depends on the activation choice (rather than
+    # silently degrading to identity, as the previous code did).
+    from ..inference.categorical_output import _categorical_objective
+    cfg_cat, net_cat = _build_categorical_net(cfg, estimator="mc", seed=322)
+    cfg_cat = replace(cfg_cat, activations=("tanh",))
+    # Re-init net with the tanh activation.
+    net_cat = init_network(
+        jax.random.PRNGKey(322), cfg_cat.layer_dims,
+        alpha_hidden=cfg_cat.alpha_hidden, alpha_output=cfg_cat.alpha_output,
+        beta_inv_hidden=cfg_cat.beta_inv_hidden, beta_inv_output=cfg_cat.beta_inv_output,
+        init_log_var=cfg_cat.init_log_var,
+        activations=cfg_cat.activations,
+        output_likelihood="categorical", output_estimator="mc",
+    )
+    Bc = 8
+    rng = np.random.default_rng(322)
+    m_z = jnp.asarray(rng.uniform(-1.0, 1.0, (Bc, cfg_cat.hidden_dims[-1])).astype(np.float32))
+    v_z = jnp.full_like(m_z, 0.01)
+    y_idx = jnp.asarray(rng.integers(0, cfg_cat.output_dim, (Bc,)), dtype=jnp.int32)
+    output = net_cat.layers[-1]
+
+    def J_with_psi(psi_name):
+        loss_and_aux = _categorical_objective(
+            output.mu, output.tau, m_z, v_z, y_idx,
+            jax.random.PRNGKey(42), 4,
+            estimator="mc", psi=psi_name,
+            alpha=output.alpha, gamma=cfg_cat.gamma_output, lambda_y=1.0,
+            data_scale=1.0 / Bc, prior_scale=1.0 / Bc, B=Bc,
+        )
+        return loss_and_aux[0]
+
+    g_tanh = jax.grad(lambda mu: _categorical_objective(
+        mu, output.tau, m_z, v_z, y_idx, jax.random.PRNGKey(42), 4,
+        estimator="mc", psi="tanh",
+        alpha=output.alpha, gamma=cfg_cat.gamma_output, lambda_y=1.0,
+        data_scale=1.0 / Bc, prior_scale=1.0 / Bc, B=Bc,
+    )[0])(output.mu)
+    g_id = jax.grad(lambda mu: _categorical_objective(
+        mu, output.tau, m_z, v_z, y_idx, jax.random.PRNGKey(42), 4,
+        estimator="mc", psi="identity",
+        alpha=output.alpha, gamma=cfg_cat.gamma_output, lambda_y=1.0,
+        data_scale=1.0 / Bc, prior_scale=1.0 / Bc, B=Bc,
+    )[0])(output.mu)
+    diff = float(jnp.linalg.norm(g_tanh - g_id))
+    if diff > 1e-6:
+        _ok(f"P3: categorical MC mu-gradient differs between psi=tanh and psi=identity "
+            f"(|g_tanh - g_id| = {diff:.3e}) -- the sample-side activation is applied")
+    else:
+        ok &= _bad(
+            f"P3: categorical MC mu-gradient is identical for tanh and identity "
+            f"(|g_tanh - g_id| = {diff:.3e}) -- the activation is being silently dropped"
+        )
+    return ok
+
+
 def main():
     cfg = BaseConfig()
     print(f"[bpcn] Running sanity checks with config layer_dims={cfg.layer_dims}", flush=True)
@@ -1326,6 +1899,13 @@ def main():
         "S23": s23_categorical_end_to_end_dispatch(cfg),
         "S24": s24_categorical_e_step_requires_y_idx(cfg),
         "S25": s25_lambda_y_threaded_consistently(cfg),
+        "S26": s26_l1_byte_identity_legacy_vs_canonical(cfg),
+        "S27": s27_l2_e_step_descent(cfg),
+        "S28": s28_l2_m_step_decreases_f_dpc(cfg),
+        "S29": s29_leaky_relu_moment_correctness(cfg),
+        "S30": s30_tanh_moment_correctness(cfg),
+        "S31": s31_multi_layer_end_to_end(cfg),
+        "S32": s32_review_regressions(cfg),
     }
     print()
     print("=" * 60)

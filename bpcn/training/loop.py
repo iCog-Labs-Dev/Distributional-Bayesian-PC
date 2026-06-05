@@ -141,9 +141,13 @@ def make_batch_step(cfg, N_train: int):
             )
             if first_m_diag is None:
                 first_m_diag = m_diag
+        # Compose per-layer first/last diagnostics across the m_step_iters
+        # inner loop. For L_hidden == 1 the hidden diag key is "hidden"
+        # (legacy); for L >= 2 it's "hidden_0", "hidden_1", ... — see
+        # `m_step` in bpcn/training/m_step.py for the naming convention.
         m_diag = {
-            "hidden": _with_loop_kl_summary(first_m_diag["hidden"], m_diag["hidden"]),
-            "output": _with_loop_kl_summary(first_m_diag["output"], m_diag["output"]),
+            k: _with_loop_kl_summary(first_m_diag[k], m_diag[k])
+            for k in m_diag
         }
 
         # Accept-or-damp post-M-step check (extension Eq. 68). Interpolates
@@ -169,8 +173,12 @@ def make_batch_step(cfg, N_train: int):
         # F_cat-DPC. Reuse the gate key for the MC diagnostic so the
         # comparison the gate uses and the snapshot we log come from the
         # same RNG draw.
+        # Pass the *tuple* of per-layer latents (frozen.m_zs / frozen.v_zs)
+        # so the multi-layer F_trans_dpc sum visits every hidden layer.
+        # Under L_hidden==1 these are 1-tuples and the result matches the
+        # legacy single-array call exactly.
         f_dpc_terms = shared_energy_terms(
-            new_net, x, y_mean, y_var, frozen.m_z, frozen.v_z,
+            new_net, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
             y_idx=y_idx, key=key_gate, mc_samples_train=mc_samples_train,
             gamma_hidden=gamma_hidden, gamma_output=gamma_output,
             weight_kl_scale=weight_kl_scale,
@@ -200,7 +208,7 @@ def _interpolate_network(net_old, net_new, omega):
         ))
     return Network(
         layers=tuple(blended),
-        psi=net_new.psi,
+        activations=net_new.activations,
         output_likelihood=net_new.output_likelihood,
         output_estimator=net_new.output_estimator,
     )
@@ -225,8 +233,10 @@ def _accept_or_damp(net_old, net_new, x, y_mean, y_var, frozen, *,
     sample draw.
     """
     def f_dpc(net_):
+        # Multi-layer aware: pass per-layer latent tuples so F_trans_dpc
+        # sums correctly when L_hidden >= 2.
         return shared_free_energy(
-            net_, x, y_mean, y_var, frozen.m_z, frozen.v_z,
+            net_, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
             y_idx=y_idx, key=key, mc_samples_train=mc_samples_train,
             kappa=kappa, gamma_hidden=gamma_hidden, gamma_output=gamma_output,
             include_weight_kl=True, weight_kl_scale=weight_kl_scale,

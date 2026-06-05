@@ -104,60 +104,64 @@ def free_energy(
     key=None,
     mc_samples_train: int = 1,
 ):
-    """Latent inference free energy F_z (Eq. 40) for the base BPCN (L_hidden = 1).
+    """Latent inference free energy F_z (v2 Eq. 40) for L_hidden >= 1.
+
+    For multi-layer, each hidden transition contributes its own NLL term
+    (v2 Eq. 36 per layer; the joint factorization is v2 Eq. 17), and the
+    latent entropy term sums over all hidden layers. The output boundary
+    operates on the *top* hidden latent only (continuation Eq. 38). This
+    function is the kappa=0 limit of `shared_free_energy`'s hidden term
+    (a per-layer expected NLL) plus the output likelihood; the categorical
+    output-head replaces the Gaussian output likelihood per the continuation
+    note.
 
     Parameters
     ----------
-    net : Network            current weight posterior (treated as stop_gradient by caller).
-    x   : [B, d_0]           inputs (z^0).
-    y   : [B, C]             observed one-hot logit targets (m_z^{out}).
-                              Ignored when output_weight == 0 (Section 6.6 test-time use).
-                              Under `net.output_likelihood == "categorical"` this
-                              is also unused (the categorical loss reads `y_idx`);
-                              callers may still pass the Gaussian one-hot to keep
-                              call sites uniform.
-    m_l : [B, d_1]           latent mean of the single hidden layer.
-    v_l : [B, d_1]           latent variance.
-    output_weight : float    Multiplier on the output likelihood term.
-                              1.0 -> training (label observed; Algorithm 1).
-                              0.0 -> test-time target-free inference (Section 6.6).
-                              Under the categorical head this plays the role of
-                              `lambda_y` (Eq. 2/48 of the continuation note).
+    m_l, v_l : tuple of arrays OR single array
+        Either a tuple of length L_hidden (multi-layer), or a single array
+        (legacy L=1 callers). Each element shape is `[B, d_l]`.
+    output_weight : float
+        Multiplier on the output likelihood term. 1.0 -> training; 0.0 ->
+        test-time target-free inference (Section 6.6). Under the categorical
+        head this also plays the role of `lambda_y` (continuation Eq. 2/48).
     y_idx, key, mc_samples_train
-        Categorical-mode kwargs. Ignored when `net.output_likelihood ==
-        "gaussian"`. Under `"categorical"` the output term becomes the
-        MEAN/MC softmax NLL of Section 4 of `categorical_output_dbpcn_continuation.pdf`.
+        Categorical-mode kwargs. Ignored when
+        `net.output_likelihood == "gaussian"`.
 
     Returns
     -------
-    F : scalar               mean F_z over the batch (N/B scaling deferred to caller).
+    F : scalar               batch-mean F_z (N/B scaling deferred to caller).
     """
-    assert net.L_hidden == 1, "free_energy here is specialised to L_hidden == 1"
-    hidden = net.layers[0]
-    output = net.layers[1]
+    m_zs = m_l if isinstance(m_l, tuple) else (m_l,)
+    v_zs = v_l if isinstance(v_l, tuple) else (v_l,)
+    dtype = m_zs[0].dtype
 
-    # Layer 1 transition: presynaptic is the input x with zero variance (Eq. 94).
-    nll_1 = transition_neg_log_density(
-        m_l, v_l,
-        m_h=x, v_h=jnp.zeros_like(x),
-        layer=hidden,
-    )
-    # Output boundary term.
+    # Per-layer hidden transition expected-NLL + entropy (v2 Eq. 40 hidden term
+    # generalized to L_hidden layers; the joint factorization is v2 Eq. 17).
+    nll_sum = jnp.zeros((), dtype=dtype)
+    neg_H_sum = jnp.zeros((), dtype=dtype)
+    for l in range(net.L_hidden):
+        if l == 0:
+            m_h, v_h = x, jnp.zeros_like(x)
+        else:
+            m_h, v_h = psi_moments(net.activations[l - 1], m_zs[l - 1], v_zs[l - 1])
+        nll_sum = nll_sum + transition_neg_log_density(
+            m_zs[l], v_zs[l], m_h=m_h, v_h=v_h, layer=net.layers[l],
+        ).mean()
+        neg_H_sum = neg_H_sum + latent_neg_entropy(v_zs[l]).mean()
+
+    # Output boundary on the top latent only (continuation Eq. 38).
+    m_top, v_top = m_zs[-1], v_zs[-1]
+    output = net.layers[-1]
     if net.output_likelihood == "gaussian":
-        # Presynaptic feature is psi_1(z^1), moments via `psi_moments` (Eq. 93).
-        m_h_out, v_h_out = psi_moments(net.psi, m_l, v_l)
-        # Per-example Gaussian NLL (mean over batch is taken in F_per_example
-        # below for shape consistency with the entropy term).
+        # Presynaptic feature h^L = psi_L(z^L); moments via `psi_moments`
+        # (v2 Eq. 21 / continuation Section 4).
+        m_h_out, v_h_out = psi_moments(net.activations[-1], m_top, v_top)
         f_out_per_example = output_neg_log_density(y, m_z=m_h_out, v_z=v_h_out, layer=output)
-        neg_H = latent_neg_entropy(v_l)
-        F_per_example = nll_1 + output_weight * f_out_per_example + neg_H   # [B]
-        return F_per_example.mean()
+        return nll_sum + output_weight * f_out_per_example.mean() + neg_H_sum
     elif net.output_likelihood == "categorical":
-        # Categorical F_out is already a batch-mean scalar (per-data-point
-        # nats); combine with the batch means of the other per-example terms.
-        f_out_mean = categorical_output_loss(net, m_l, v_l, y_idx, key, mc_samples_train)
-        neg_H = latent_neg_entropy(v_l)
-        return nll_1.mean() + output_weight * f_out_mean + neg_H.mean()
+        f_out_mean = categorical_output_loss(net, m_top, v_top, y_idx, key, mc_samples_train)
+        return nll_sum + output_weight * f_out_mean + neg_H_sum
     else:
         raise ValueError(
             f"unknown output_likelihood: {net.output_likelihood!r}; "

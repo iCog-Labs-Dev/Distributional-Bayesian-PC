@@ -51,7 +51,7 @@ import jax.numpy as jnp
 from ..models.layer import Layer
 from ..losses.weight_kl import gaussian_weight_kl
 from ..utils.safe_math import clamp_tau
-from .feature_moments import psi_moments
+from .feature_moments import psi_moments, apply_psi_sample
 
 
 def _mean_logits(mu, m_h):
@@ -74,7 +74,9 @@ def mean_categorical_loss(net, m_z, v_z, y_idx):
     return is in per-data-point ("nats per example") scale, matching the
     codebase's data-term convention (mean over the batch).
     """
-    m_h, _ = psi_moments(net.psi, m_z, v_z)
+    # Output head consumes h^L = psi_L(z^L); psi_L is the last entry of the
+    # per-layer activations tuple (continuation Section 4 / Eq. 16).
+    m_h, _ = psi_moments(net.activations[-1], m_z, v_z)
     output = net.layers[-1]
     logits = _mean_logits(output.mu, m_h)
     return _per_example_nll(logits, y_idx).mean()
@@ -105,18 +107,19 @@ def mc_categorical_loss(net, m_z, v_z, y_idx, key, S):
     output = net.layers[-1]
     sigma_y = jnp.sqrt(jnp.exp(output.tau))
     sigma_z = jnp.sqrt(v_z)
-    psi = net.psi
+    # Output head boundary: only psi_L (continuation Eq. 26) applies to the
+    # sampled top latent; interior activations are baked into m_z via the E-step.
+    psi_top = net.activations[-1]
     mu = output.mu
 
     def one_sample(k):
         k_W, k_z = jax.random.split(k)
         W_sample = mu + sigma_y * jax.random.normal(k_W, mu.shape)
         z_sample = m_z + sigma_z * jax.random.normal(k_z, m_z.shape)
-        # Apply psi exactly to the sample (Section 4.5 option 4 / matches
-        # _mc_predict_from_frozen). For psi != relu/identity this branch
-        # has to grow alongside _mc_predict_from_frozen.
-        if psi == "relu":
-            z_sample = jax.nn.relu(z_sample)
+        # Apply psi_L exactly to the sample (Section 4.5 option 4 / matches
+        # _mc_predict_from_frozen). `apply_psi_sample` dispatches across
+        # identity / relu / leaky_relu / tanh.
+        z_sample = apply_psi_sample(psi_top, z_sample)
         logits = z_sample @ W_sample.T                 # [B, C]
         return _per_example_nll(logits, y_idx)         # [B]
 
@@ -202,8 +205,12 @@ def _categorical_objective(
             k_W, k_z = jax.random.split(k)
             W_sample = mu + sigma_y * jax.random.normal(k_W, mu.shape)
             z_sample = m_z + sigma_z * jax.random.normal(k_z, m_z.shape)
-            if psi == "relu":
-                z_sample = jax.nn.relu(z_sample)
+            # Apply psi_L exactly to the sample (Section 4.5 option 4 /
+            # continuation Eq. 26: a^(s) = W^(s) psi_L(z^(L,(s)))). Must
+            # dispatch across all four activations -- a previous version
+            # only handled "relu" and silently became the identity for
+            # leaky_relu/tanh, training against an identity-head loss.
+            z_sample = apply_psi_sample(psi, z_sample)
             logits = z_sample @ W_sample.T
             return _per_example_nll(logits, y_idx)
 

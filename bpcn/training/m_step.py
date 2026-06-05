@@ -260,34 +260,57 @@ def m_step(
                        layer's `update_layer(...)` call is unchanged in
                        either mode.
     """
-    hidden = net.layers[0]
-    output = net.layers[1]
-
+    L_hidden = net.L_hidden
+    output = net.layers[-1]
+    # Per-layer prox-anchor weights from `net_old`. None for the off-by-default
+    # rho_w == 0 path; otherwise a list parallel to `net.layers`.
     if net_old is not None:
-        mu_old_h, tau_old_h = net_old.layers[0].mu, net_old.layers[0].tau
-        mu_old_o, tau_old_o = net_old.layers[1].mu, net_old.layers[1].tau
+        mu_old_list = [net_old.layers[l].mu for l in range(L_hidden + 1)]
+        tau_old_list = [net_old.layers[l].tau for l in range(L_hidden + 1)]
     else:
-        mu_old_h = tau_old_h = mu_old_o = tau_old_o = None
+        mu_old_list = [None] * (L_hidden + 1)
+        tau_old_list = [None] * (L_hidden + 1)
 
-    # Hidden layer target = frozen latent (m_z, v_z); presynaptic = x with V=0  (Eq. 94).
-    M_hid = jax.lax.stop_gradient(x)
-    V_hid = jnp.zeros_like(M_hid)
-    new_hidden, hid_diags = update_layer(
-        hidden,
-        M=M_hid, V=V_hid,
-        m_z=frozen.m_z, v_z=frozen.v_z,
-        alpha=alpha_hidden, gamma=gamma_hidden,
-        eta_mu=eta_mu_hidden, eta_tau=eta_tau_hidden,
-        data_scale=data_scale, prior_scale=prior_scale,
-        r_max=r_max, rho_w=rho_w,
-        mu_old=mu_old_h, tau_old=tau_old_h,
-    )
+    # Per-layer hidden M-step (v2 Section 6.4 / Algorithm 2; continuation
+    # Section 6.1 retains this loop unchanged under the categorical extension).
+    # For each hidden layer l in 0..L_hidden-1:
+    #   - presynaptic moments: (x, 0) if l==0 (v2 Eq. 94), else psi_{l-1}(z^l)
+    #     (v2 Eq. 21 / Section 4.5).
+    #   - postsynaptic target: frozen.m_zs[l], frozen.v_zs[l] (stop-gradient'd
+    #     in the E-step output).
+    new_hiddens = []
+    hidden_diags = {}
+    for l in range(L_hidden):
+        if l == 0:
+            M_l = jax.lax.stop_gradient(x)
+            V_l = jnp.zeros_like(M_l)
+        else:
+            M_l, V_l = psi_moments(net.activations[l - 1], frozen.m_zs[l - 1], frozen.v_zs[l - 1])
+        new_layer, diag = update_layer(
+            net.layers[l],
+            M=M_l, V=V_l,
+            m_z=frozen.m_zs[l], v_z=frozen.v_zs[l],
+            alpha=alpha_hidden, gamma=gamma_hidden,
+            eta_mu=eta_mu_hidden, eta_tau=eta_tau_hidden,
+            data_scale=data_scale, prior_scale=prior_scale,
+            r_max=r_max, rho_w=rho_w,
+            mu_old=mu_old_list[l], tau_old=tau_old_list[l],
+        )
+        new_hiddens.append(new_layer)
+        # Per-layer diagnostics key. For L_hidden == 1 we emit "hidden" only
+        # (legacy contract; preserves byte-identity of downstream logging).
+        # For L_hidden >= 2 we emit "hidden_l" per layer; an aggregate
+        # "hidden" alias (= the top hidden's diag, i.e. the layer closest
+        # to the output and the most informative single scalar) is added
+        # *after* the loop so existing log/summary code that reads
+        # m_diag["hidden"] keeps working.
+        hidden_diags["hidden" if L_hidden == 1 else f"hidden_{l}"] = diag
 
+    # Output-layer update. Presynaptic feature for the output uses psi_L on
+    # the *top* hidden latent (continuation Section 4 / Eq. 16).
     if net.output_likelihood == "gaussian":
         # Output layer target = (y_mean, y_var) [Gaussian-logit; assumption I3].
-        # Presynaptic feature = psi_1(z^1); moments propagate via psi_moments
-        # (Section 4.5; default psi="identity" recovers the pass-through case).
-        M_out, V_out = psi_moments(net.psi, frozen.m_z, frozen.v_z)
+        M_out, V_out = psi_moments(net.activations[-1], frozen.m_zs[-1], frozen.v_zs[-1])
         new_output, out_diags = update_layer(
             output,
             M=M_out, V=V_out,
@@ -296,23 +319,17 @@ def m_step(
             eta_mu=eta_mu_output, eta_tau=eta_tau_output,
             data_scale=data_scale, prior_scale=prior_scale,
             r_max=r_max, rho_w=rho_w,
-            mu_old=mu_old_o, tau_old=tau_old_o,
+            mu_old=mu_old_list[-1], tau_old=tau_old_list[-1],
         )
     elif net.output_likelihood == "categorical":
-        # Categorical softmax head (Eq. 43 of continuation note). Uses
-        # jax.grad on the categorical loss + weight-KL objective. Note that
-        # proximal weight damping (rho_w) is not applied here; if needed,
-        # it could be added by extending categorical_output_update with the
-        # extension Eq. 64 anchor (mu_old_o, tau_old_o). For now the
-        # damping is a Gaussian-mode safeguard.
+        # Categorical softmax head (continuation Eqs. 43-45 / Section 6.2).
+        # `categorical_output_update` consumes only the top latent
+        # (frozen.m_z / frozen.v_z via the backward-compat properties).
         if y_idx is None:
             raise ValueError(
                 "m_step requires `y_idx` when net.output_likelihood == 'categorical'"
             )
         if key is None:
-            # Fallback PRNG key. The training loop should always pass a key;
-            # this is here so unit-test call sites that only build single-step
-            # examples in MEAN mode don't crash.
             key = jax.random.PRNGKey(0)
         new_output, out_diags = categorical_output_update(
             output, frozen, y_idx, key,
@@ -325,7 +342,7 @@ def m_step(
             data_scale=data_scale,
             prior_scale=prior_scale,
             lambda_y=lambda_y,
-            psi=net.psi,
+            psi=net.activations[-1],
         )
     else:
         raise ValueError(
@@ -333,5 +350,15 @@ def m_step(
             f"choices: 'gaussian', 'categorical'"
         )
 
-    new_net = net._replace(layers=(new_hidden, new_output))
-    return new_net, {"hidden": hid_diags, "output": out_diags}
+    new_layers = tuple(new_hiddens) + (new_output,)
+    new_net = net._replace(layers=new_layers)
+    diag_out = dict(hidden_diags)
+    # Multi-layer aggregate alias so downstream loggers that read
+    # `m_diag["hidden"]` (which expect the L=1 contract) keep working.
+    # We use the *top* hidden layer's diag (l = L_hidden - 1, closest to
+    # the output) -- the most informative single scalar for monitoring
+    # progress and the natural extension of the L=1 contract.
+    if L_hidden >= 2:
+        diag_out["hidden"] = hidden_diags[f"hidden_{L_hidden - 1}"]
+    diag_out["output"] = out_diags
+    return new_net, diag_out

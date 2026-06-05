@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..inference.e_step import e_step
-from ..inference.feature_moments import psi_moments
+from ..inference.feature_moments import psi_moments, apply_psi_sample
 
 
 def _target_free_frozen(
@@ -60,7 +60,7 @@ def _target_free_frozen(
 
 def _mean_predict_from_frozen(net, frozen):
     # Presynaptic feature to the output layer is psi_1(m_z) (Section 4.5).
-    m_h, _ = psi_moments(net.psi, frozen.m_z, frozen.v_z)
+    m_h, _ = psi_moments(net.activations[-1], frozen.m_z, frozen.v_z)
     return jax.nn.softmax(m_h @ net.layers[-1].mu.T, axis=-1)
 
 
@@ -69,18 +69,19 @@ def _mc_predict_from_frozen(net, frozen, key, S: int):
     sigma_y = jnp.sqrt(jnp.exp(output.tau))
     sigma_z = jnp.sqrt(frozen.v_z)
     m_z = frozen.m_z
-    psi = net.psi
+    # Top-latent activation psi_L is the only one consumed by the output
+    # head (continuation Eq. 26: a^(s) = W^(s) psi_L(z^(L,(s)))).
+    psi_top = net.activations[-1]
 
     def one_sample(k):
         k_W, k_z = jax.random.split(k)
         W_sample = output.mu + sigma_y * jax.random.normal(k_W, output.mu.shape)
         z_sample = m_z + sigma_z * jax.random.normal(k_z, m_z.shape)
-        # Apply psi to the sample directly (Section 4.5 option 4: MC samples
+        # Apply psi_L to the sample directly (Section 4.5 option 4: MC samples
         # through psi). This is exact for the sample; the delta-method
         # approximation used by `psi_moments` is only needed when no samples
         # are available.
-        if psi == "relu":
-            z_sample = jax.nn.relu(z_sample)
+        z_sample = apply_psi_sample(psi_top, z_sample)
         logits = z_sample @ W_sample.T                     # [B, C]
         return jax.nn.softmax(logits, axis=-1)
 
