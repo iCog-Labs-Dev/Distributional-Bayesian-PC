@@ -25,14 +25,24 @@ class BaseConfig:
     n_train_total: int = 0
     n_test_total: int = 0
 
-    # --- Architecture (plan §3.1, I1, I2) ------------------------------------
+    # --- Architecture (v2 Eqs. 7, 20-22) -------------------------------------
     input_dim: int = 784
+    # `hidden_dims` is the canonical multi-layer field: hidden_dims[l] is
+    # the width of hidden latent z^{l+1} (zero-indexed in code, one-indexed
+    # in the v2 write-up). For L=1 this is `(hidden_dim,)`. For deeper nets
+    # (e.g. `(256, 128)`) the layer_dims become `(input, 256, 128, output)`.
+    # Empty default `()` => __post_init__ derives it from `hidden_dim` for
+    # backward compat with old `config.json` files.
+    hidden_dims: Tuple[int, ...] = ()
+    # Per-layer feature maps psi_l (v2 Eq. 21, Section 4.5). Length must
+    # equal len(hidden_dims). Each element is one of
+    # {"identity", "relu", "leaky_relu", "tanh"}. Empty default `()` =>
+    # __post_init__ derives it from `psi` for backward compat.
+    activations: Tuple[str, ...] = ()
+    # Legacy single-layer shortcuts. Use `hidden_dims` and `activations`
+    # for new configs; these remain for backward-compat with saved configs
+    # produced before the multi-layer refactor.
     hidden_dim: int = 128
-    # output_dim derived from len(classes)
-    # Feature map between the hidden latent z^1 and the presynaptic feature
-    # to the output layer (Section 4.5 of v2 write-up).
-    # "identity" preserves the linear base architecture.
-    # "relu" uses the delta-method ReLU moment propagation.
     psi: str = "identity"
 
     # --- Initialization (Eqs. 98-99, plan U5) --------------------------------
@@ -152,8 +162,67 @@ class BaseConfig:
             val = getattr(self, name)
             if val is not None and val <= 0:
                 raise ValueError(f"{name} must be > 0 when set, got {val}")
-        if self.psi not in ("identity", "relu"):
-            raise ValueError(f"psi must be 'identity' or 'relu', got {self.psi!r}")
+        # Backward-compat: derive `hidden_dims` / `activations` tuples from the
+        # legacy `hidden_dim` / `psi` scalars when the tuple fields are empty.
+        # Frozen-dataclass pattern: `object.__setattr__` is required.
+        _ALLOWED_PSI = ("identity", "relu", "leaky_relu", "tanh")
+        if self.psi not in _ALLOWED_PSI:
+            raise ValueError(
+                f"psi must be one of {_ALLOWED_PSI}, got {self.psi!r}"
+            )
+        # Tuples loaded from JSON arrive as lists; coerce to tuple for
+        # downstream consistency (so e.g. `cfg.hidden_dims[0]` and
+        # `tuple(cfg.hidden_dims)` are identical).
+        if isinstance(self.hidden_dims, list):
+            object.__setattr__(self, "hidden_dims", tuple(self.hidden_dims))
+        if isinstance(self.activations, list):
+            object.__setattr__(self, "activations", tuple(self.activations))
+
+        # Legacy<->canonical resolution. Two cases produce a populated tuple:
+        #   (a) direct construction `BaseConfig(hidden_dim=64)`: the tuple
+        #       default is `()`; the empty-tuple guard below fills it.
+        #   (b) `dataclasses.replace(BaseConfig(), hidden_dim=64)`: the
+        #       *cfg* already had `__post_init__` run on it, so the tuple
+        #       is `(128,)` (default derivation), and the replace copies
+        #       that into the new instance. Without re-derivation here,
+        #       the legacy override would be silently dropped. We detect
+        #       this by: legacy field is non-default AND tuple equals the
+        #       default-derivation, then re-derive from the (now-overridden)
+        #       legacy value. When user explicitly sets the canonical tuple
+        #       (even to the same value as default-derived), the canonical
+        #       wins; this is unambiguous because the user must opt into
+        #       a non-trivial multi-layer tuple to trip the canonical path.
+        default_hidden_dim = type(self).__dataclass_fields__["hidden_dim"].default
+        default_psi = type(self).__dataclass_fields__["psi"].default
+        if (self.hidden_dim != default_hidden_dim
+                and self.hidden_dims == (default_hidden_dim,)):
+            object.__setattr__(self, "hidden_dims", (self.hidden_dim,))
+        if (self.psi != default_psi
+                and self.activations == (default_psi,)):
+            object.__setattr__(self, "activations", (self.psi,))
+        # Direct-construction fallback: empty tuple => derive from legacy scalar.
+        if not self.hidden_dims:
+            object.__setattr__(self, "hidden_dims", (self.hidden_dim,))
+        if not self.activations:
+            object.__setattr__(self, "activations", (self.psi,))
+        # Validate the canonical multi-layer fields.
+        if len(self.activations) != len(self.hidden_dims):
+            raise ValueError(
+                f"activations length ({len(self.activations)}) must equal "
+                f"hidden_dims length ({len(self.hidden_dims)}); got "
+                f"activations={self.activations}, hidden_dims={self.hidden_dims}"
+            )
+        for a in self.activations:
+            if a not in _ALLOWED_PSI:
+                raise ValueError(
+                    f"each activations entry must be one of {_ALLOWED_PSI}, "
+                    f"got {a!r} in {self.activations}"
+                )
+        for d in self.hidden_dims:
+            if d < 1:
+                raise ValueError(
+                    f"each hidden_dims entry must be >= 1, got {d} in {self.hidden_dims}"
+                )
         if self.target_scale <= 0:
             raise ValueError(f"target_scale must be > 0, got {self.target_scale}")
         if self.objective not in ("pc_free_energy", "shared_dpc"):
@@ -194,7 +263,18 @@ class BaseConfig:
 
     @property
     def layer_dims(self) -> Tuple[int, ...]:
-        return (self.input_dim, self.hidden_dim, self.output_dim)
+        """Full layer-dim tuple (input, *hidden_dims, output).
+
+        Resolves through `hidden_dims` (the multi-layer canonical field), which
+        `__post_init__` populates from the legacy `hidden_dim` scalar when the
+        tuple is empty. For L_hidden = 1 this matches the legacy
+        `(input_dim, hidden_dim, output_dim)`.
+        """
+        return (self.input_dim, *self.hidden_dims, self.output_dim)
+
+    @property
+    def L_hidden(self) -> int:
+        return len(self.hidden_dims)
 
     @property
     def eval_T_z_resolved(self) -> int:
