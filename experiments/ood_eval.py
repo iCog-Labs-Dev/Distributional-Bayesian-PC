@@ -41,19 +41,52 @@ from typing import Dict, List, Tuple
 
 path.append(".")
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from bpcn.configs.base import BaseConfig
 from bpcn.data.mnist import load_split
-from bpcn.evaluation.predict import (
-    _mc_predict_from_frozen,
-    _mean_predict_from_frozen,
-    _target_free_frozen,
-    predictive_entropy,
-)
+from bpcn.evaluation.predict import _eval_one_batch
 from experiments.mnist import _load_checkpoint
+
+
+@partial(jax.jit, static_argnames=(
+    "n_batches", "batch_size", "T_z", "mc_samples",
+))
+def _scan_predict_padded_jit(
+    net, x_padded, keys, *,
+    n_batches, batch_size,
+    T_z, eta_m, eta_u, v_init,
+    gamma_hidden, gamma_output, mc_samples,
+):
+    """Scan `_eval_one_batch` over [n_batches, batch_size, ...] and return
+    the concatenated MC + MEAN probability arrays.
+
+    Shared OOD eval primitive: identical math to the per-batch Python loop
+    it replaces, but in one fused XLA graph so the only device->host sync
+    is the final `np.asarray` call after this returns.
+    """
+    x_b = x_padded.reshape(n_batches, batch_size, -1)
+
+    def step(_carry, args):
+        k, xb = args
+        p_mc, p_mean = _eval_one_batch(
+            net, xb, k,
+            T_z=T_z, eta_m=eta_m, eta_u=eta_u, v_init=v_init,
+            gamma_hidden=gamma_hidden, gamma_output=gamma_output,
+            mc_samples=mc_samples,
+        )
+        return _carry, (p_mc, p_mean)
+
+    _, (p_mc_b, p_mean_b) = jax.lax.scan(step, None, (keys, x_b))
+    # [n_batches, batch_size, C] -> [N_padded, C]
+    return (
+        p_mc_b.reshape(n_batches * batch_size, -1),
+        p_mean_b.reshape(n_batches * batch_size, -1),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -217,43 +250,49 @@ def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
     target-free E-step per batch shared between MEAN and MC predictives so the
     only difference between the two is sampling-vs-mean. Adds ECE and top-1
     confidence on top of the standard metric set.
+
+    Runs as a single fused JAX graph via `_scan_predict_padded_jit`:
+    pad-to-multiple-of-batch + scan + one device->host transfer of the
+    concatenated probability arrays. ECE is computed host-side via
+    `_ece(probs, y_idx, bins)` because it requires the full array for bin
+    assignment; everything else is a one-line numpy reduction over the
+    transferred probs.
     """
     N = len(x)
     n_batches = (N + batch_size - 1) // batch_size
-    # Match `evaluate_split`'s key indexing exactly: it allocates N+1 keys and
-    # consumes keys[1], keys[2], ... per batch (keys[0] is unused). Mirroring
-    # that convention here means angle=0 reproduces the saved final-epoch MC
-    # metrics bit-identically with the same eval-key seed.
-    keys = jax.random.split(key, max(n_batches, 1) + 1)
+    N_padded = n_batches * batch_size
+    pad = N_padded - N
 
-    p_mc_all: List[np.ndarray] = []
-    p_mean_all: List[np.ndarray] = []
-    ent_mc_chunks: List[np.ndarray] = []
-    ent_mean_chunks: List[np.ndarray] = []
-
-    for bi in range(n_batches):
-        sl = slice(bi * batch_size, min((bi + 1) * batch_size, N))
-        x_b = jnp.asarray(x[sl])
-        frozen = _target_free_frozen(
-            net, x_b,
-            T_z=cfg.eval_T_z_resolved,
-            eta_m=cfg.eval_eta_m_resolved,
-            eta_u=cfg.eval_eta_u_resolved,
-            v_init=cfg.eval_v_init_resolved,
-            gamma_hidden=cfg.gamma_hidden,
-            gamma_output=cfg.gamma_output,
+    x_arr = jnp.asarray(x)
+    if pad > 0:
+        x_padded = jnp.concatenate(
+            [x_arr, jnp.zeros((pad, x_arr.shape[1]), dtype=x_arr.dtype)],
+            axis=0,
         )
-        p_mean = _mean_predict_from_frozen(net, frozen)
-        p_mc = _mc_predict_from_frozen(net, frozen, keys[bi + 1], mc_samples)
-        p_mc_all.append(np.asarray(p_mc))
-        p_mean_all.append(np.asarray(p_mean))
-        ent_mc_chunks.append(np.asarray(predictive_entropy(p_mc)))
-        ent_mean_chunks.append(np.asarray(predictive_entropy(p_mean)))
+    else:
+        x_padded = x_arr
 
-    p_mc_arr = np.concatenate(p_mc_all, axis=0)
-    p_mean_arr = np.concatenate(p_mean_all, axis=0)
-    ent_mc = np.concatenate(ent_mc_chunks)
-    ent_mean = np.concatenate(ent_mean_chunks)
+    # Match `evaluate_split`'s key-allocation convention exactly so the
+    # angle=0 self-test reproduces the saved final-epoch MC metrics
+    # bit-identically with the same eval-key seed: allocate `n_batches + 1`
+    # keys and discard the 0th.
+    keys = jax.random.split(key, max(n_batches, 1) + 1)[1:]
+
+    p_mc_padded, p_mean_padded = _scan_predict_padded_jit(
+        net, x_padded, keys,
+        n_batches=n_batches, batch_size=batch_size,
+        T_z=int(cfg.eval_T_z_resolved),
+        eta_m=float(cfg.eval_eta_m_resolved),
+        eta_u=float(cfg.eval_eta_u_resolved),
+        v_init=float(cfg.eval_v_init_resolved),
+        gamma_hidden=float(cfg.gamma_hidden),
+        gamma_output=float(cfg.gamma_output),
+        mc_samples=int(mc_samples),
+    )
+
+    # Single device->host transfer; trim padded rows.
+    p_mc_arr = np.asarray(p_mc_padded)[:N]
+    p_mean_arr = np.asarray(p_mean_padded)[:N]
 
     pred_mc = p_mc_arr.argmax(axis=-1)
     pred_mean = p_mean_arr.argmax(axis=-1)
@@ -262,6 +301,13 @@ def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
     log_p_mean = np.log(np.clip(p_mean_arr[idx, y_idx], 1e-12, 1.0))
     conf_mc = p_mc_arr.max(axis=-1).mean()
     conf_mean = p_mean_arr.max(axis=-1).mean()
+
+    # Per-example entropies (Eq. 104). Computed host-side off the already-
+    # transferred probability arrays so we don't pay a second device sync.
+    p_mc_clip = np.clip(p_mc_arr, 1e-12, 1.0)
+    p_mean_clip = np.clip(p_mean_arr, 1e-12, 1.0)
+    ent_mc = -np.sum(p_mc_clip * np.log(p_mc_clip), axis=-1)
+    ent_mean = -np.sum(p_mean_clip * np.log(p_mean_clip), axis=-1)
 
     return {
         # MC predictive

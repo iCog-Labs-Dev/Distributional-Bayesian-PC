@@ -454,7 +454,7 @@ def run(
 
         if run_eval and (epoch % cfg.eval_every == 0 or epoch == cfg.epochs):
             key, ek = jax.random.split(key)
-            metrics = evaluate_split(net, test, cfg, ek, batch_size=256)
+            metrics = evaluate_split(net, test, cfg, ek)
             # Variance decomposition uses the target-free test-time E-step
             # (descends F_DPC at output_weight=0) so the diagnostic is at the
             # same fixed point evaluate_split uses.
