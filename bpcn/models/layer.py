@@ -89,8 +89,3 @@ def init_layer(
     tau = jnp.clip(tau, TAU_MIN, TAU_MAX)
     beta_inv_arr = jnp.full((d_out,), float(beta_inv))
     return Layer(mu=mu, tau=tau, beta_inv=beta_inv_arr, alpha=float(alpha))
-
-
-def count_params(layer: Layer) -> int:
-    """Number of (mu, tau) scalars in a layer = 2 * d_out * p_in (Section 7.2, Eq. 109)."""
-    return 2 * layer.d_out * layer.p_in

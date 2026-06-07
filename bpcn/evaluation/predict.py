@@ -22,23 +22,17 @@ from ..inference.feature_moments import psi_moments, apply_psi_sample
 def _target_free_frozen(
     net, x, *,
     T_z, eta_m, eta_u, v_init,
-    objective: str = "pc_free_energy",
-    kappa: float = 1.0,
     y_var=None,
     gamma_hidden: float = 1.0,
     gamma_output: float = 1.0,
 ):
-    """Run the target-free test-time E-step (Section 6.6 paragraph 1).
+    """Run the target-free test-time E-step (v2 Section 6.6 paragraph 1).
 
-    Returns the frozen (m_z, v_z) latent posterior obtained by descending the
-    chosen `objective` with `output_weight=0.0` (no target). Shared by
-    `mc_predict`, `mean_predict`, and `evaluate_split` so the same frozen
-    latents are used across diagnostics.
-
-    `objective`, `kappa`, `y_var`, `gamma_hidden`, `gamma_output` are
-    forwarded to `e_step` so the eval E-step can match the *training*
-    objective (e.g. `objective="shared_dpc"` for shared-DPC-trained models),
-    keeping train and test inference internally consistent.
+    Descends F_DPC (extension Eq. 12) with `output_weight=0.0` so the latent
+    is anchored only by the hidden transition. Returns the frozen (m_z, v_z)
+    posterior used by `evaluate_split` (via `_mc_predict_from_frozen` and
+    `_mean_predict_from_frozen`) so MC and MEAN predictives share one
+    target-free E-step.
     """
     B = x.shape[0]
     C = net.layers[-1].d_out
@@ -50,8 +44,6 @@ def _target_free_frozen(
         T_z=T_z, eta_m=eta_m, eta_u=eta_u, v_init=v_init,
         output_weight=0.0,
         y_var=y_var,
-        objective=objective,
-        kappa=kappa,
         gamma_hidden=gamma_hidden,
         gamma_output=gamma_output,
     )
@@ -90,85 +82,10 @@ def _mc_predict_from_frozen(net, frozen, key, S: int):
     return probs.mean(axis=0)
 
 
-def mean_predict(
-    net, x, *,
-    T_z, eta_m, eta_u, v_init,
-    objective: str = "pc_free_energy",
-    kappa: float = 1.0,
-    y_var=None,
-    gamma_hidden: float = 1.0,
-    gamma_output: float = 1.0,
-):
-    """Posterior-mean predictive: softmax(m_z @ mu_y.T), no MC sampling.
-
-    Runs the same target-free test-time E-step as `mc_predict` (Section 6.6
-    paragraph 1) but skips MC sampling of W and z. The resulting prediction
-    uses the posterior mean weights and the E-step's final latent mean
-    directly. Pair with `mc_predict` to disentangle MC sampling noise from
-    a genuinely diffuse weight posterior: if mean entropy << MC entropy at
-    the same accuracy, the wide MC predictive is sampling variance, not
-    posterior σ² that has anything to say.
-
-    See `_target_free_frozen` for the `objective` / `kappa` / `y_var` /
-    `gamma_*` kwargs: defaults reproduce legacy F_z target-free eval,
-    `objective="shared_dpc"` matches shared-DPC training.
-    """
-    frozen = _target_free_frozen(
-        net, x,
-        T_z=T_z, eta_m=eta_m, eta_u=eta_u, v_init=v_init,
-        objective=objective, kappa=kappa, y_var=y_var,
-        gamma_hidden=gamma_hidden, gamma_output=gamma_output,
-    )
-    return _mean_predict_from_frozen(net, frozen)
-
-
-def mc_predict(
-    net, x, y_dummy, *,
-    T_z, eta_m, eta_u, v_init, key, S: int,
-    objective: str = "pc_free_energy",
-    kappa: float = 1.0,
-    y_var=None,
-    gamma_hidden: float = 1.0,
-    gamma_output: float = 1.0,
-):
-    """Monte Carlo predictive (Eq. 103) using target-free test-time E-step.
-
-    Per Section 6.6 paragraph 1: "Given x_*, clamp z_*^0 = x_* and run the
-    E-step without a target if doing unsupervised or OOD scoring". We run
-    e_step with output_weight=0.0 so the latent posterior is anchored only
-    by the transition prior and the latent entropy.
-
-    See `_target_free_frozen` for the `objective` / `kappa` / `y_var` /
-    `gamma_*` kwargs: defaults reproduce legacy F_z target-free eval,
-    `objective="shared_dpc"` matches shared-DPC training.
-
-    Returns: p_hat [B, C], probabilities averaged over S weight samples.
-    """
-    frozen = _target_free_frozen(
-        net, x,
-        T_z=T_z, eta_m=eta_m, eta_u=eta_u, v_init=v_init,
-        objective=objective, kappa=kappa, y_var=y_var,
-        gamma_hidden=gamma_hidden, gamma_output=gamma_output,
-    )
-    return _mc_predict_from_frozen(net, frozen, key, S)
-
-
 def predictive_entropy(p_hat):
     """H[y | x*, D] = -sum_c p_c log p_c  (Eq. 104)."""
     p = jnp.clip(p_hat, 1e-12, 1.0)
     return -jnp.sum(p * jnp.log(p), axis=-1)
-
-
-def accuracy(p_hat, y_true_idx):
-    """Argmax accuracy."""
-    pred = jnp.argmax(p_hat, axis=-1)
-    return jnp.mean(pred == y_true_idx)
-
-
-def predictive_log_likelihood(p_hat, y_true_idx):
-    """Mean log p_hat(y_true | x)."""
-    p = jnp.clip(p_hat, 1e-12, 1.0)
-    return jnp.mean(jnp.log(p[jnp.arange(p.shape[0]), y_true_idx]))
 
 
 def evaluate_split(net, split, cfg, key, *, batch_size: int = 256):
@@ -176,8 +93,9 @@ def evaluate_split(net, split, cfg, key, *, batch_size: int = 256):
 
     Returns the standard MC keys (`accuracy`, `log_likelihood_mean`,
     `entropy_mean`, `entropy_std`, `n`) plus a parallel `mean_*` set computed
-    from `mean_predict` over the same target-free E-step latents. Both passes
-    share the same per-batch RNG split for MC; the mean pass uses no RNG.
+    from `_mean_predict_from_frozen` over the same target-free E-step latents.
+    Both passes share the same per-batch RNG split for MC; the mean pass uses
+    no RNG.
     """
     N = len(split.x)
     correct_mc = correct_mean = 0
@@ -193,17 +111,14 @@ def evaluate_split(net, split, cfg, key, *, batch_size: int = 256):
         ki += 1
         # Share one target-free E-step between both predictives so the only
         # difference is sampling-vs-mean, not which latent posterior was used.
-        # Eval objective defaults to the training objective via cfg, keeping
-        # the test-time E-step consistent with the scalar the model was
-        # trained against. Override via cfg.eval_objective if needed.
+        # The eval E-step descends the same shared energy F_DPC (extension
+        # Eq. 12) as training.
         frozen = _target_free_frozen(
             net, x,
             T_z=cfg.eval_T_z_resolved,
             eta_m=cfg.eval_eta_m_resolved,
             eta_u=cfg.eval_eta_u_resolved,
             v_init=cfg.eval_v_init_resolved,
-            objective=cfg.eval_objective_resolved,
-            kappa=1.0,
             gamma_hidden=cfg.gamma_hidden,
             gamma_output=cfg.gamma_output,
         )

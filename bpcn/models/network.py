@@ -16,7 +16,6 @@ single-layer architecture.
 """
 from typing import NamedTuple, Tuple
 import jax
-import jax.numpy as jnp
 
 from .layer import Layer, init_layer
 
@@ -176,21 +175,3 @@ def init_network(
         output_likelihood=output_likelihood,
         output_estimator=output_estimator,
     )
-
-
-def forward_mean(net: Network, x: jax.Array) -> jax.Array:
-    """Pure-mean feed-forward through all layers; smoke-test helper only.
-
-    This does NOT do Bayesian inference. It propagates posterior means
-    through every layer and applies the configured activation between
-    consecutive layers per v2 Eq. 21.
-    """
-    # Local import to avoid a module-level cycle with bpcn.inference.feature_moments
-    # (which is imported by inference modules that depend on `Network`).
-    from ..inference.feature_moments import psi_moments
-    h = x
-    for l, layer in enumerate(net.layers):
-        h = h @ layer.mu.T
-        if l < net.L_hidden:
-            h, _ = psi_moments(net.activations[l], h, jnp.zeros_like(h))
-    return h

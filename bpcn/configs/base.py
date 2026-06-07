@@ -1,13 +1,19 @@
-"""Base-stage configuration for 2-class MNIST BPCN.
+"""BPCN configuration dataclass.
 
 References (write-up: distributional_predictive_coding_v2.pdf):
-- Section 6.1: modeling assumptions for the simplest BPCN.
+- Section 6.1: modeling assumptions.
 - Section 6.2: initialization scales (Eqs. 98-99).
 - Section 6.7: stopping criteria (Eq. 106).
 
-Constants here are implementation choices (plan §1.3 unknowns U2-U5).
+References (extension: shared_energy_dbpcn_extension.pdf):
+- Eq. 12: F_DPC, the canonical shared free energy descended by training.
+- Algorithm 3: training-loop hyperparameters.
+
+References (continuation: categorical_output_dbpcn_continuation.pdf):
+- Section 4.1/4.2: MEAN vs MC categorical estimator (output_estimator).
+- Eq. 2/48: F_cat-DPC = lambda_y F_out + F_trans-DPC + F_weight-KL.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 
@@ -27,23 +33,15 @@ class BaseConfig:
 
     # --- Architecture (v2 Eqs. 7, 20-22) -------------------------------------
     input_dim: int = 784
-    # `hidden_dims` is the canonical multi-layer field: hidden_dims[l] is
-    # the width of hidden latent z^{l+1} (zero-indexed in code, one-indexed
-    # in the v2 write-up). For L=1 this is `(hidden_dim,)`. For deeper nets
-    # (e.g. `(256, 128)`) the layer_dims become `(input, 256, 128, output)`.
-    # Empty default `()` => __post_init__ derives it from `hidden_dim` for
-    # backward compat with old `config.json` files.
-    hidden_dims: Tuple[int, ...] = ()
+    # `hidden_dims[l]` is the width of hidden latent z^{l+1} (zero-indexed in
+    # code, one-indexed in the v2 write-up). For a single hidden layer this is
+    # `(128,)`; for deeper nets (e.g. `(256, 128)`) the layer_dims become
+    # `(input, 256, 128, output)`.
+    hidden_dims: Tuple[int, ...] = (128,)
     # Per-layer feature maps psi_l (v2 Eq. 21, Section 4.5). Length must
     # equal len(hidden_dims). Each element is one of
-    # {"identity", "relu", "leaky_relu", "tanh"}. Empty default `()` =>
-    # __post_init__ derives it from `psi` for backward compat.
-    activations: Tuple[str, ...] = ()
-    # Legacy single-layer shortcuts. Use `hidden_dims` and `activations`
-    # for new configs; these remain for backward-compat with saved configs
-    # produced before the multi-layer refactor.
-    hidden_dim: int = 128
-    psi: str = "identity"
+    # {"identity", "relu", "leaky_relu", "tanh"}.
+    activations: Tuple[str, ...] = ("identity",)
 
     # --- Initialization (Eqs. 98-99, plan U5) --------------------------------
     init_log_var: float = -6.0               # tau_0 = log sigma_0^2  (sigma_0 ~ 0.05)
@@ -69,7 +67,6 @@ class BaseConfig:
     eta_tau_output: float = 1e-4
     gamma_hidden: float = 1.0                # prior KL coefficient gamma_l (Eq. 62)
     gamma_output: float = 1.0
-    gamma_warmup_epochs: int = 0             # linear warm-up; 0 disables
     m_step_iters: int = 1                    # inner M-step gradient updates per batch
                                              # (Section 6.7: "one or a few" updates)
 
@@ -111,23 +108,6 @@ class BaseConfig:
     mc_samples_train: int = 1
     lambda_y: float = 1.0
 
-    # --- Shared-energy extension (M-SE) --------------------------------------
-    # References: shared_energy_dbpcn_extension.pdf.
-    # objective='pc_free_energy' (LEGACY) descends Eq. 40 of the original
-    #   BPCN write-up, but uses the current predictive latent initialization.
-    # objective='shared_dpc'              switches the E-step to descend the
-    #   shared energy F_kappa of extension Eq. 63 (which at kappa=1 is F_DPC
-    #   of Eq. 12). The M-step gradient algebra is unchanged in either mode.
-    objective: str = "shared_dpc"            # M-SE default: shared-energy E-step
-    kappa_start: float = 1.0                 # initial kappa (extension Eq. 63)
-    kappa_warmup_epochs: int = 0             # epochs to ramp kappa_start -> 1.0; 0 = no ramp
-    rho_z: float = 0.0                       # proximal latent damping (Eq. 65); 0 = off
-    rho_w: float = 0.0                       # proximal weight damping (Eq. 64); 0 = off
-    r_max: Optional[float] = None            # bounded variance residual (Eq. 67); None = off
-    accept_or_damp: bool = False             # accept-or-damp M-step (Eq. 68)
-    accept_damp_omega: float = 0.5           # omega for damped update (Eq. 68)
-    accept_damp_tol: float = 0.0             # tolerance on F_DPC increase before damping
-
     # --- Training (Algorithm 3) ----------------------------------------------
     epochs: int = 5
     eval_every: int = 1                      # evaluate every K epochs
@@ -139,11 +119,6 @@ class BaseConfig:
     eval_eta_m: Optional[float] = None       # None -> eta_m
     eval_eta_u: Optional[float] = None       # None -> eta_u
     eval_v_init: Optional[float] = None      # target-free variance floor; None -> v_init
-    # Eval E-step objective. None -> match training objective via the
-    # eval_objective_resolved property so train and test inference descend
-    # the same scalar. Set explicitly to "pc_free_energy" or "shared_dpc"
-    # for ablation or regression-test consistency.
-    eval_objective: Optional[str] = None
 
     # --- Output directory ----------------------------------------------------
     run_dir: str = "runs/base"
@@ -162,50 +137,21 @@ class BaseConfig:
             val = getattr(self, name)
             if val is not None and val <= 0:
                 raise ValueError(f"{name} must be > 0 when set, got {val}")
-        # Backward-compat: derive `hidden_dims` / `activations` tuples from the
-        # legacy `hidden_dim` / `psi` scalars when the tuple fields are empty.
-        # Frozen-dataclass pattern: `object.__setattr__` is required.
-        _ALLOWED_PSI = ("identity", "relu", "leaky_relu", "tanh")
-        if self.psi not in _ALLOWED_PSI:
-            raise ValueError(
-                f"psi must be one of {_ALLOWED_PSI}, got {self.psi!r}"
-            )
         # Tuples loaded from JSON arrive as lists; coerce to tuple for
         # downstream consistency (so e.g. `cfg.hidden_dims[0]` and
-        # `tuple(cfg.hidden_dims)` are identical).
+        # `tuple(cfg.hidden_dims)` are identical). Frozen-dataclass pattern:
+        # `object.__setattr__` is required.
         if isinstance(self.hidden_dims, list):
             object.__setattr__(self, "hidden_dims", tuple(self.hidden_dims))
         if isinstance(self.activations, list):
             object.__setattr__(self, "activations", tuple(self.activations))
 
-        # Legacy<->canonical resolution. Two cases produce a populated tuple:
-        #   (a) direct construction `BaseConfig(hidden_dim=64)`: the tuple
-        #       default is `()`; the empty-tuple guard below fills it.
-        #   (b) `dataclasses.replace(BaseConfig(), hidden_dim=64)`: the
-        #       *cfg* already had `__post_init__` run on it, so the tuple
-        #       is `(128,)` (default derivation), and the replace copies
-        #       that into the new instance. Without re-derivation here,
-        #       the legacy override would be silently dropped. We detect
-        #       this by: legacy field is non-default AND tuple equals the
-        #       default-derivation, then re-derive from the (now-overridden)
-        #       legacy value. When user explicitly sets the canonical tuple
-        #       (even to the same value as default-derived), the canonical
-        #       wins; this is unambiguous because the user must opt into
-        #       a non-trivial multi-layer tuple to trip the canonical path.
-        default_hidden_dim = type(self).__dataclass_fields__["hidden_dim"].default
-        default_psi = type(self).__dataclass_fields__["psi"].default
-        if (self.hidden_dim != default_hidden_dim
-                and self.hidden_dims == (default_hidden_dim,)):
-            object.__setattr__(self, "hidden_dims", (self.hidden_dim,))
-        if (self.psi != default_psi
-                and self.activations == (default_psi,)):
-            object.__setattr__(self, "activations", (self.psi,))
-        # Direct-construction fallback: empty tuple => derive from legacy scalar.
+        # Validate the canonical multi-layer architecture fields.
+        _ALLOWED_PSI = ("identity", "relu", "leaky_relu", "tanh")
         if not self.hidden_dims:
-            object.__setattr__(self, "hidden_dims", (self.hidden_dim,))
+            raise ValueError("hidden_dims must be a non-empty tuple of layer widths")
         if not self.activations:
-            object.__setattr__(self, "activations", (self.psi,))
-        # Validate the canonical multi-layer fields.
+            raise ValueError("activations must be a non-empty tuple of feature maps")
         if len(self.activations) != len(self.hidden_dims):
             raise ValueError(
                 f"activations length ({len(self.activations)}) must equal "
@@ -225,24 +171,6 @@ class BaseConfig:
                 )
         if self.target_scale <= 0:
             raise ValueError(f"target_scale must be > 0, got {self.target_scale}")
-        if self.objective not in ("pc_free_energy", "shared_dpc"):
-            raise ValueError(f"objective must be 'pc_free_energy' or 'shared_dpc', got {self.objective!r}")
-        if self.eval_objective is not None and self.eval_objective not in ("pc_free_energy", "shared_dpc"):
-            raise ValueError(
-                f"eval_objective must be None, 'pc_free_energy', or 'shared_dpc', got {self.eval_objective!r}"
-            )
-        if not 0.0 <= self.kappa_start <= 1.0:
-            raise ValueError(f"kappa_start must be in [0, 1], got {self.kappa_start}")
-        if self.kappa_warmup_epochs < 0:
-            raise ValueError(f"kappa_warmup_epochs must be >= 0, got {self.kappa_warmup_epochs}")
-        if self.rho_z < 0:
-            raise ValueError(f"rho_z must be >= 0, got {self.rho_z}")
-        if self.rho_w < 0:
-            raise ValueError(f"rho_w must be >= 0, got {self.rho_w}")
-        if self.r_max is not None and self.r_max <= 0:
-            raise ValueError(f"r_max must be > 0 when set, got {self.r_max}")
-        if not 0.0 < self.accept_damp_omega <= 1.0:
-            raise ValueError(f"accept_damp_omega must be in (0, 1], got {self.accept_damp_omega}")
         if self.output_likelihood not in ("gaussian", "categorical"):
             raise ValueError(
                 f"output_likelihood must be 'gaussian' or 'categorical', "
@@ -263,13 +191,7 @@ class BaseConfig:
 
     @property
     def layer_dims(self) -> Tuple[int, ...]:
-        """Full layer-dim tuple (input, *hidden_dims, output).
-
-        Resolves through `hidden_dims` (the multi-layer canonical field), which
-        `__post_init__` populates from the legacy `hidden_dim` scalar when the
-        tuple is empty. For L_hidden = 1 this matches the legacy
-        `(input_dim, hidden_dim, output_dim)`.
-        """
+        """Full layer-dim tuple `(input_dim, *hidden_dims, output_dim)`."""
         return (self.input_dim, *self.hidden_dims, self.output_dim)
 
     @property
@@ -291,23 +213,3 @@ class BaseConfig:
     @property
     def eval_v_init_resolved(self) -> float:
         return self.v_init if self.eval_v_init is None else self.eval_v_init
-
-    @property
-    def eval_objective_resolved(self) -> str:
-        """Eval-time E-step objective; defaults to the training objective."""
-        return self.objective if self.eval_objective is None else self.eval_objective
-
-    def kappa_for_epoch(self, epoch: int) -> float:
-        """Compute kappa for a given epoch (1-indexed) via linear ramp.
-
-        Reference: extension Eq. 63. kappa interpolates linearly from
-        `kappa_start` at epoch 1 to 1.0 at epoch (kappa_warmup_epochs + 1),
-        then stays at 1.0. When `kappa_warmup_epochs == 0`, kappa is 1.0
-        from epoch 1 onward (no homotopy).
-        """
-        if self.kappa_warmup_epochs <= 0:
-            return 1.0
-        if epoch >= self.kappa_warmup_epochs + 1:
-            return 1.0
-        frac = (epoch - 1) / float(self.kappa_warmup_epochs)
-        return float(self.kappa_start + frac * (1.0 - self.kappa_start))

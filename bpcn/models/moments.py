@@ -11,7 +11,6 @@ References (write-up: distributional_predictive_coding_v2.pdf):
 """
 from typing import Tuple
 import jax
-import jax.numpy as jnp
 
 from .layer import Layer
 

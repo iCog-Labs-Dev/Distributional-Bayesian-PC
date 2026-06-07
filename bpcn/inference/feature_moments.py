@@ -65,11 +65,6 @@ def tanh_delta_moments(m_z, v_z):
     return t, (jac * jac) * v_z
 
 
-def zero_input_moments(x):
-    """For the first layer: m_h^0 = x, v_h^0 = 0 (Eq. 94 with deterministic input)."""
-    return x, jnp.zeros_like(x)
-
-
 _PSI_DISPATCH = {
     "identity": identity_moments,
     "relu": relu_delta_moments,

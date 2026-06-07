@@ -6,9 +6,8 @@ References (write-up: distributional_predictive_coding_v2.pdf):
 
 References (extension: shared_energy_dbpcn_extension.pdf):
 - Eq. 72: F_DPC = F_out + F_trans-DPC + F_weight-KL decomposition.
-- Eq. 63: kappa-homotopy schedule logging.
 """
-from typing import List, Dict, Optional
+from typing import List, Dict
 import numpy as np
 
 from ..models.moments import variance_components
@@ -20,7 +19,7 @@ class EpochDiagnostics:
     def __init__(self):
         self.records: List[Dict] = []
 
-    def add(self, e_diag, m_diag, f_dpc=None, kappa: Optional[float] = None):
+    def add(self, e_diag, m_diag, f_dpc=None):
         """Append one minibatch's diagnostics to the per-epoch record.
 
         Parameters
@@ -33,9 +32,6 @@ class EpochDiagnostics:
             When the loop returns these (always in current implementation),
             they are recorded as F_out, F_trans_dpc, F_weight_kl. When None
             (legacy single-stage runs), the entries are omitted.
-        kappa : float or None
-            kappa-homotopy value used for this batch (extension Eq. 63).
-            When None, omitted.
         """
         rec = {
             "F_initial": float(np.asarray(e_diag.F_initial)),
@@ -47,10 +43,8 @@ class EpochDiagnostics:
             rec["F_out"] = float(np.asarray(f_dpc.f_out))
             rec["F_trans_dpc"] = float(np.asarray(f_dpc.f_trans_dpc))
             rec["F_weight_kl"] = float(np.asarray(f_dpc.f_weight_kl))
-            # Total F_DPC including the prior KL (extension Eq. 12 at kappa=1).
+            # Total F_DPC = F_out + F_trans-DPC + F_weight-KL (extension Eq. 12).
             rec["F_DPC_total"] = rec["F_out"] + rec["F_trans_dpc"] + rec["F_weight_kl"]
-        if kappa is not None:
-            rec["kappa"] = float(kappa)
         for name, ld in m_diag.items():
             rec[f"{name}/kl_data"] = float(np.asarray(ld.kl_data))
             rec[f"{name}/kl_data_before"] = float(np.asarray(ld.kl_data_before))

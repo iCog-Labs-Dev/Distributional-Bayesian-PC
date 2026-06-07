@@ -1,4 +1,4 @@
-"""Predictive-coding latent E-step (Algorithm 1) with optional shared-energy dispatch.
+"""Predictive-coding latent E-step (Algorithm 1) descending the shared energy.
 
 References (write-up: distributional_predictive_coding_v2.pdf):
 - Section 4.3 / Algorithm 1 (Section 6.3).
@@ -11,18 +11,13 @@ References (write-up: distributional_predictive_coding_v2.pdf):
   Bayesian prior variance, floored by v_init.
 
 References (extension: shared_energy_dbpcn_extension.pdf):
+- Eq. 12: F_DPC -- the shared energy this E-step descends.
 - Eq. 22-23: E-step descends F_DPC, not the legacy F_z.
 - Eq. 31: full latent update with target and source roles.
-- Eq. 63: kappa-homotopy F_kappa.
-- Eq. 65: proximal latent damping F_E-prox.
 - Algorithm 1 (Section 6.1 of the extension): shared-energy latent E-step.
 
 Assumption I4 (plan): autodiff over (m, u) buffers with the weight pytree
 under stop_gradient. The E-step never updates weights.
-
-The `objective` kwarg selects between:
-- "pc_free_energy" : legacy Eq. 40 free energy.
-- "shared_dpc"     : extension Eq. 63 F_kappa shared energy.
 """
 from typing import NamedTuple, Tuple
 import jax
@@ -30,8 +25,6 @@ import jax.numpy as jnp
 
 from ..models.network import Network
 from ..models.moments import moment_forward
-from ..losses.distributional_kl import gaussian_kl
-from .free_energy import free_energy
 from .shared_energy import shared_free_energy
 from .feature_moments import psi_moments
 from ..utils.safe_math import clamp_u
@@ -108,11 +101,7 @@ def e_step(
     eta_u: float,
     v_init: float,
     output_weight: float = 1.0,
-    # Shared-energy extension kwargs (defaults preserve legacy behaviour).
     y_var=None,
-    objective: str = "pc_free_energy",
-    kappa: float = 1.0,
-    rho_z: float = 0.0,
     gamma_hidden: float = 1.0,
     gamma_output: float = 1.0,
     # Categorical-output kwargs (continuation note). Consumed only when
@@ -123,8 +112,9 @@ def e_step(
 ) -> Tuple[FrozenLatents, EStepDiagnostics]:
     """Run T_z latent gradient steps then freeze (Algorithm 1 / extension Alg. 1).
 
-    Weights enter under stop_gradient (assumption I4); no weight gradient flows
-    out of this function.
+    Descends the shared free energy F_DPC (extension Eq. 12) with the weight
+    pytree under `jax.lax.stop_gradient`. Assumption I4: no weight gradient
+    flows out of this function.
 
     Parameters
     ----------
@@ -132,27 +122,13 @@ def e_step(
         Output target as a mean vector. For Gaussian-logit targets (I3),
         this is `y_mean` and the caller should also pass `y_var`.
     output_weight : float
-        Multiplier on the output target term. 1.0 (default) is Algorithm 1;
-        0.0 is target-free test-time inference (Section 6.6 paragraph 1).
-        Applies to both `objective="pc_free_energy"` (scales legacy output
-        likelihood) and `objective="shared_dpc"` (scales the K_out shared-KL
-        term, parallel to legacy behavior).
+        Multiplier on the output target term (K_out, extension Eq. 12 first
+        sum). 1.0 (default) is Algorithm 1; 0.0 is target-free test-time
+        inference (Section 6.6 paragraph 1). Under the categorical head this
+        also plays the role of `lambda_y` (continuation Eq. 2/48).
     y_var : [B, C] or None
         Output target variance for Gaussian-logit targets (assumption I3).
-        Required when `objective == "shared_dpc"`. If None, defaults to a
-        zero array (deterministic targets) which is mathematically equivalent
-        to the legacy output term at output_weight=1.
-    objective : str
-        Which scalar to descend:
-        - "pc_free_energy": legacy Eq. 40 free energy (NLL + entropy).
-        - "shared_dpc"    : extension Eq. 63 F_kappa.
-    kappa : float in [0, 1]
-        kappa-homotopy mixing weight for the hidden transition (Eq. 63).
-        Ignored when objective == "pc_free_energy".
-    rho_z : float, >= 0
-        Proximal latent damping coefficient (extension Eq. 65). 0 = off.
-        Anchors the latent posterior to its feedforward initialization
-        (m_init, u_init) for each scan iteration.
+        If None, defaults to a zero array (deterministic targets).
     gamma_hidden, gamma_output : float
         Per-layer prior-KL coefficients gamma_l. Forwarded to shared energy
         for include_weight_kl=False (E-step does not need the constant
@@ -164,9 +140,6 @@ def e_step(
         per iteration so each T_z step uses independent randomness. Under
         `output_likelihood == "gaussian"` these are ignored.
     """
-    if objective not in ("pc_free_energy", "shared_dpc"):
-        raise ValueError(f"unknown objective: {objective!r}")
-
     W = jax.lax.stop_gradient(net)
     m0, u0 = initial_latents(W, x, v_init)
 
@@ -198,42 +171,17 @@ def e_step(
     if key is None:
         key = jax.random.PRNGKey(0)
 
-    use_prox = float(rho_z) != 0.0
-    # Stop-gradient through prox anchors so they don't flow back into params.
-    m_init = jax.lax.stop_gradient(m0) if use_prox else None
-    u_init = jax.lax.stop_gradient(u0) if use_prox else None
-
     def F_of_log_var(m, u, k):
         # m, u are tuples of length L_hidden; jax.tree.map applies exp per layer.
         v = jax.tree.map(jnp.exp, u)
-        if objective == "shared_dpc":
-            F = shared_free_energy(
-                W, x, y, y_var, m, v,
-                y_idx=y_idx, key=k, mc_samples_train=mc_samples_train,
-                kappa=kappa,
-                gamma_hidden=gamma_hidden,
-                gamma_output=gamma_output,
-                include_weight_kl=False,
-                output_weight=output_weight,
-            )
-        else:  # "pc_free_energy"
-            F = free_energy(
-                W, x, y, m, v,
-                output_weight=output_weight,
-                y_idx=y_idx, key=k, mc_samples_train=mc_samples_train,
-            )
-        if use_prox:
-            # Proximal latent damping (extension Eq. 65), summed over hidden
-            # layers. Anchored at the feedforward initial (m_init, u_init).
-            prox = jnp.zeros((), dtype=m[0].dtype)
-            for l in range(len(m)):
-                v_anchor_l = jnp.exp(u_init[l])
-                prox = prox + gaussian_kl(
-                    m_z=m[l], v_z=v[l],
-                    m_p=m_init[l], v_p=v_anchor_l,
-                ).kl.sum(axis=-1).mean()
-            F = F + float(rho_z) * prox
-        return F
+        return shared_free_energy(
+            W, x, y, y_var, m, v,
+            y_idx=y_idx, key=k, mc_samples_train=mc_samples_train,
+            gamma_hidden=gamma_hidden,
+            gamma_output=gamma_output,
+            include_weight_kl=False,
+            output_weight=output_weight,
+        )
 
     grad_fn = jax.grad(F_of_log_var, argnums=(0, 1))
 
