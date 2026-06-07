@@ -240,8 +240,6 @@ def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
             eta_m=cfg.eval_eta_m_resolved,
             eta_u=cfg.eval_eta_u_resolved,
             v_init=cfg.eval_v_init_resolved,
-            objective=cfg.eval_objective_resolved,
-            kappa=1.0,
             gamma_hidden=cfg.gamma_hidden,
             gamma_output=cfg.gamma_output,
         )

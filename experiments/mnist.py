@@ -1,10 +1,11 @@
 """MNIST experiment orchestrator for the Distributional BPCN.
 
-Single CLI entry point for class-incremental MNIST experiments. The
-argparse surface IS the user-facing tunable surface: every BPCN
-hyperparameter from `distributional_predictive_coding_v2.pdf` (network
-shape, learning rates, priors, residual variance, E-step iterations,
-M-step gradient scaling, target encoding) is exposed.
+Single CLI entry point for MNIST experiments. The argparse surface IS the
+user-facing tunable surface: every BPCN hyperparameter from
+`distributional_predictive_coding_v2.pdf` (network shape, learning rates,
+priors, residual variance, E-step iterations, M-step gradient scaling,
+target encoding) is exposed, plus the categorical-output controls from
+`categorical_output_dbpcn_continuation.pdf`.
 
 Usage
 -----
@@ -114,7 +115,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="experiments.mnist",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="BPCN class-incremental MNIST experiment.",
+        description="BPCN MNIST experiment.",
     )
 
     g_data = p.add_argument_group("dataset")
@@ -136,15 +137,10 @@ def parse_args(argv=None):
         "--input-dim", type=int, default=None,
         help="Input dim d_0 (Eq. 20; 784 for flattened MNIST).")
     g_net.add_argument(
-        "--hidden-dim", type=int, default=None,
-        help="(Legacy single-layer.) Hidden latent dim d_1 (Eq. 22). "
-             "Prefer --hidden-dims for multi-layer configs.")
-    g_net.add_argument(
         "--hidden-dims", type=_parse_int_list, default=None,
         help="Comma-separated hidden layer dims for multi-layer DBPCN. "
              "E.g. '256,128' builds L_hidden=2 with widths d_1=256, d_2=128. "
-             "Length must equal --activations length. Overrides --hidden-dim "
-             "when both are passed.")
+             "Length must equal --activations length.")
     g_net.add_argument(
         "--hidden-init", type=str, default=None, choices=["xavier", "he"],
         help="Init scaling kappa_l for hidden weights (Eq. 98). Shared across "
@@ -155,11 +151,6 @@ def parse_args(argv=None):
     g_net.add_argument(
         "--init-log-var", type=float, default=None,
         help="Initial tau = log sigma_0^2 (Eq. 99, Section 8.1).")
-    g_net.add_argument(
-        "--psi", type=str, default=None,
-        choices=["identity", "relu", "leaky_relu", "tanh"],
-        help="(Legacy single-layer.) Activation between the one hidden latent "
-             "and the output (Section 4.5). Prefer --activations for multi-layer.")
     g_net.add_argument(
         "--activations", type=_parse_activations, default=None,
         help="Comma-separated per-layer activations psi_l. Length must equal "
@@ -214,9 +205,6 @@ def parse_args(argv=None):
         "--gamma-output", type=float, default=None,
         help="Prior KL coefficient gamma_y in Eq. 62.")
     g_m.add_argument(
-        "--gamma-warmup-epochs", type=int, default=None,
-        help="Linear gamma annealing window (Section 4.5 allows annealing).")
-    g_m.add_argument(
         "--m-step-iters", type=_positive_int, default=None,
         help="Inner M-step gradient updates per minibatch (Section 6.7 'one or a few').")
 
@@ -258,38 +246,6 @@ def parse_args(argv=None):
              "F_trans-DPC + F_weight-KL (Eq. 2/48 of continuation). 1.0 matches "
              "the hidden transition scale.")
 
-    g_se = p.add_argument_group("shared-energy extension (M-SE; shared_energy_dbpcn_extension.pdf)")
-    g_se.add_argument(
-        "--objective", type=str, default=None, choices=["pc_free_energy", "shared_dpc"],
-        help="E-step objective: 'pc_free_energy' = legacy Eq. 40; "
-             "'shared_dpc' = extension Eq. 63 F_kappa (default).")
-    g_se.add_argument(
-        "--kappa-start", type=float, default=None,
-        help="Initial kappa for the kappa-homotopy ramp (extension Eq. 63). "
-             "Ignored when --kappa-warmup-epochs == 0.")
-    g_se.add_argument(
-        "--kappa-warmup-epochs", type=int, default=None,
-        help="Linearly ramp kappa from --kappa-start to 1.0 over the first K epochs "
-             "(extension Eq. 63). 0 = no homotopy (kappa = 1 from epoch 1).")
-    g_se.add_argument(
-        "--rho-z", type=float, default=None,
-        help="Proximal latent damping coefficient (extension Eq. 65). 0 = off.")
-    g_se.add_argument(
-        "--rho-w", type=float, default=None,
-        help="Proximal weight damping coefficient (extension Eq. 64). 0 = off.")
-    g_se.add_argument(
-        "--r-max", type=float, default=None,
-        help="Bounded variance residual r_max (extension Eq. 67). None = off.")
-    g_se.add_argument(
-        "--accept-or-damp", action="store_true",
-        help="Enable accept-or-damp M-step (extension Eq. 68).")
-    g_se.add_argument(
-        "--accept-damp-omega", type=float, default=None,
-        help="Omega for accept-or-damp interpolation (extension Eq. 68).")
-    g_se.add_argument(
-        "--accept-damp-tol", type=float, default=None,
-        help="Tolerance on F_DPC increase before damping is triggered.")
-
     g_train = p.add_argument_group("training and evaluation")
     g_train.add_argument(
         "--epochs", type=int, default=None,
@@ -315,9 +271,6 @@ def parse_args(argv=None):
     g_train.add_argument(
         "--eval-v-init", type=_positive_float, default=None,
         help="Target-free test-time latent variance floor; defaults to --v-init.")
-    g_train.add_argument(
-        "--eval-objective", type=str, default=None, choices=["pc_free_energy", "shared_dpc"],
-        help="Target-free eval E-step objective. Defaults to matching --objective.")
     g_train.add_argument(
         "--no-eval", action="store_true",
         help="Skip MC eval each epoch (faster smoke runs).")
@@ -346,21 +299,17 @@ def parse_args(argv=None):
 # to snake_case dest; T_z is the one exception (preserves the write-up symbol).
 _CFG_FIELDS = (
     "classes", "batch_size",
-    "input_dim", "hidden_dim", "hidden_dims", "hidden_init", "output_init", "init_log_var",
-    "psi", "activations",
+    "input_dim", "hidden_dims", "hidden_init", "output_init", "init_log_var",
+    "activations",
     "alpha_hidden", "alpha_output", "beta_inv_hidden", "beta_inv_output",
     "T_z", "eta_m", "eta_u", "v_init",
     "eta_mu_hidden", "eta_tau_hidden", "eta_mu_output", "eta_tau_output",
-    "gamma_hidden", "gamma_output", "gamma_warmup_epochs", "m_step_iters",
+    "gamma_hidden", "gamma_output", "m_step_iters",
     "target_var", "target_scale",
     # Categorical output head (continuation note).
     "output_likelihood", "output_estimator", "mc_samples_train", "lambda_y",
-    # M-SE shared-energy extension fields.
-    "objective", "kappa_start", "kappa_warmup_epochs",
-    "rho_z", "rho_w", "r_max",
-    "accept_or_damp", "accept_damp_omega", "accept_damp_tol",
     "epochs", "eval_every", "seed", "mc_samples",
-    "eval_T_z", "eval_eta_m", "eval_eta_u", "eval_v_init", "eval_objective",
+    "eval_T_z", "eval_eta_m", "eval_eta_u", "eval_v_init",
     "run_dir",
 )
 
@@ -368,9 +317,8 @@ _CFG_FIELDS = (
 def build_config(args) -> BaseConfig:
     """Build a BaseConfig by overlaying CLI overrides on the BaseConfig defaults.
 
-    Any CLI argument that the user left at its default (None or False) keeps
-    the BaseConfig value. BaseConfig is frozen, so we use dataclasses.replace.
-    `accept_or_damp` is a store_true flag, so override only when True.
+    Any CLI argument that the user left at its default (None) keeps the
+    BaseConfig value. BaseConfig is frozen, so we use dataclasses.replace.
     """
     cfg = BaseConfig()
     overrides = {}
@@ -378,30 +326,7 @@ def build_config(args) -> BaseConfig:
         val = getattr(args, f, None)
         if val is None:
             continue
-        # `accept_or_damp` is store_true; only override when explicitly set.
-        if f == "accept_or_damp" and not val:
-            continue
         overrides[f] = val
-    # Promote legacy single-layer CLI flags to the canonical multi-layer
-    # tuple form *before* `dataclasses.replace`. Without this, replacing a
-    # default-constructed BaseConfig (which has already populated
-    # `hidden_dims=(128,)` / `activations=("identity",)` in __post_init__)
-    # with only `--hidden-dim 64` / `--psi relu` would leave the tuple fields
-    # at their derived defaults -- the legacy CLI flags would be silently
-    # ignored. We refuse to combine legacy and canonical for the same axis
-    # to avoid ambiguous precedence (e.g. `--hidden-dim 64 --hidden-dims 256`).
-    if "hidden_dim" in overrides and "hidden_dims" not in overrides:
-        overrides["hidden_dims"] = (int(overrides["hidden_dim"]),)
-    elif "hidden_dim" in overrides and "hidden_dims" in overrides:
-        raise argparse.ArgumentTypeError(
-            "Pass either --hidden-dim (legacy) or --hidden-dims (multi-layer), not both."
-        )
-    if "psi" in overrides and "activations" not in overrides:
-        overrides["activations"] = (overrides["psi"],)
-    elif "psi" in overrides and "activations" in overrides:
-        raise argparse.ArgumentTypeError(
-            "Pass either --psi (legacy) or --activations (multi-layer), not both."
-        )
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
     return cfg
@@ -488,7 +413,6 @@ def run(
         ep_diag = EpochDiagnostics()
         t0 = time.time()
         n_batches = count_batches(train, cfg.batch_size, drop_last=True)
-        kappa_epoch = jnp.float32(cfg.kappa_for_epoch(epoch))
         epoch_key = jax.random.fold_in(train_base_key, epoch)
         for bi, batch in enumerate(iter_minibatches(
             train,
@@ -506,24 +430,24 @@ def run(
                 jnp.asarray(batch.y_var),
                 jnp.asarray(batch.y_idx),
                 batch_key,
-                kappa_epoch,
             )
-            ep_diag.add(e_diag, m_diag, f_dpc=f_dpc, kappa=float(kappa_epoch))
+            ep_diag.add(e_diag, m_diag, f_dpc=f_dpc)
             if (bi + 1) % 20 == 0 or bi == n_batches - 1:
                 last = ep_diag.records[-1]
                 log_fn(
                     f"[bpcn.mnist]   epoch {epoch} batch {bi+1}/{n_batches} "
                     f"F_init={last['F_initial']:.4f} F_final={last['F_final']:.4f} "
-                    f"F_DPC={last['F_DPC_total']:.4f} kappa={last['kappa']:.2f} "
+                    f"F_DPC={last['F_DPC_total']:.4f} "
                     f"kl_data(out)={last['output/kl_data']:.4f}"
                 )
 
         summary = ep_diag.summary()
         elapsed = time.time() - t0
+        top_hidden = f"hidden_{cfg.L_hidden - 1}"
         log_fn(
             f"[bpcn.mnist] epoch {epoch} done in {elapsed:.1f}s; "
             f"avg F_init={summary['F_initial']:.4f} F_final={summary['F_final']:.4f} "
-            f"kl_data(hid)={summary['hidden/kl_data']:.4f} "
+            f"kl_data({top_hidden})={summary[f'{top_hidden}/kl_data']:.4f} "
             f"kl_data(out)={summary['output/kl_data']:.4f}"
         )
         epoch_record = {"epoch": epoch, "elapsed_s": elapsed, "summary": summary}
@@ -532,9 +456,8 @@ def run(
             key, ek = jax.random.split(key)
             metrics = evaluate_split(net, test, cfg, ek, batch_size=256)
             # Variance decomposition uses the target-free test-time E-step
-            # under the configured eval objective so the diagnostic is at the
-            # same fixed point evaluate_split uses. y_var stays zero because
-            # output_weight=0 disables K_out in both objectives.
+            # (descends F_DPC at output_weight=0) so the diagnostic is at the
+            # same fixed point evaluate_split uses.
             xb = jnp.asarray(test.x[:256])
             yb = jnp.zeros((256, cfg.output_dim), dtype=xb.dtype)
             yvb = jnp.zeros_like(yb)
@@ -546,8 +469,6 @@ def run(
                 v_init=cfg.eval_v_init_resolved,
                 output_weight=0.0,
                 y_var=yvb,
-                objective=cfg.eval_objective_resolved,
-                kappa=1.0,
                 gamma_hidden=cfg.gamma_hidden,
                 gamma_output=cfg.gamma_output,
             )

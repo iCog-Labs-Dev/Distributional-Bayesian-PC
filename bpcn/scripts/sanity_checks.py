@@ -25,8 +25,7 @@ from ..models.network import init_network
 from ..models.moments import moment_forward
 from ..models.layer import init_layer, Layer
 from ..inference.e_step import e_step, initial_latents
-from ..inference.feature_moments import psi_moments, relu_delta_moments
-from ..inference.free_energy import free_energy
+from ..inference.feature_moments import psi_moments
 from ..inference.shared_energy import shared_free_energy, _output_predictive, shared_energy_terms
 from ..inference.categorical_output import (
     mean_categorical_loss,
@@ -59,12 +58,13 @@ def s1_shape_consistency(cfg):
                        beta_inv_hidden=cfg.beta_inv_hidden, beta_inv_output=cfg.beta_inv_output,
                        init_log_var=cfg.init_log_var)
     L = net.layers
+    h0 = cfg.hidden_dims[0]
     expected = [
-        ("L0.mu", L[0].mu.shape, (cfg.hidden_dim, cfg.input_dim)),
-        ("L0.tau", L[0].tau.shape, (cfg.hidden_dim, cfg.input_dim)),
-        ("L0.beta_inv", L[0].beta_inv.shape, (cfg.hidden_dim,)),
-        ("L1.mu", L[1].mu.shape, (cfg.output_dim, cfg.hidden_dim)),
-        ("L1.tau", L[1].tau.shape, (cfg.output_dim, cfg.hidden_dim)),
+        ("L0.mu", L[0].mu.shape, (h0, cfg.input_dim)),
+        ("L0.tau", L[0].tau.shape, (h0, cfg.input_dim)),
+        ("L0.beta_inv", L[0].beta_inv.shape, (h0,)),
+        ("L1.mu", L[1].mu.shape, (cfg.output_dim, h0)),
+        ("L1.tau", L[1].tau.shape, (cfg.output_dim, h0)),
         ("L1.beta_inv", L[1].beta_inv.shape, (cfg.output_dim,)),
     ]
     ok = True
@@ -103,7 +103,7 @@ def s2_positive_variance(cfg):
                              eta_mu_hidden=cfg.eta_mu_hidden, eta_tau_hidden=cfg.eta_tau_hidden,
                              eta_mu_output=cfg.eta_mu_output, eta_tau_output=cfg.eta_tau_output,
                              data_scale=1.0 / B, prior_scale=1.0 / B)
-    v_p_min_hidden = float(m_diag["hidden"].components["v_p_min"])
+    v_p_min_hidden = float(m_diag["hidden_0"].components["v_p_min"])
     v_p_min_output = float(m_diag["output"].components["v_p_min"])
     if v_p_min_hidden > 0: _ok(f"v_p min (hidden) = {v_p_min_hidden:.3e} > 0")
     else: ok &= _bad(f"v_p min (hidden) = {v_p_min_hidden:.3e}")
@@ -346,14 +346,12 @@ def s9_iterative_m_step(cfg):
     batch_key = jax.random.PRNGKey(0)         # Gaussian mode ignores the key
     net = init_network(key, cfg.layer_dims)
 
-    # Use the SAME objective as the loop will (cfg.objective) so the manual
-    # E-step reference matches the loop's E-step bit-for-bit.
+    # The manual E-step reference descends the same shared energy F_DPC
+    # (extension Eq. 12) as the training loop, bit-for-bit.
     frozen, _ = e_step(
         net, x, y,
         T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
         y_var=y_var,
-        objective=cfg.objective,
-        kappa=1.0,
         gamma_hidden=cfg.gamma_hidden,
         gamma_output=cfg.gamma_output,
     )
@@ -367,7 +365,7 @@ def s9_iterative_m_step(cfg):
     )
     batch_step_1 = make_batch_step(cfg1, N_train=B)
     loop_net_1, _, loop_diag_1, _ = batch_step_1(
-        net, x, y, y_var, y_idx, batch_key, jnp.float32(1.0)
+        net, x, y, y_var, y_idx, batch_key
     )
     max_diff = 0.0
     for direct_layer, loop_layer in zip(direct_net.layers, loop_net_1.layers):
@@ -384,7 +382,7 @@ def s9_iterative_m_step(cfg):
     cfg3 = replace(cfg, batch_size=B, m_step_iters=3)
     batch_step_3 = make_batch_step(cfg3, N_train=B)
     _, _, loop_diag_3, _ = batch_step_3(
-        net, x, y, y_var, y_idx, batch_key, jnp.float32(1.0)
+        net, x, y, y_var, y_idx, batch_key
     )
     for name, ld in loop_diag_3.items():
         loop_delta = float(ld.kl_data_loop_delta)
@@ -422,7 +420,7 @@ def s10_F_DPC_monotone(cfg):
     _, diag = e_step(
         net, x, y,
         T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
         gamma_hidden=cfg.gamma_hidden, gamma_output=cfg.gamma_output,
     )
     trace = np.asarray(diag.F_trace)
@@ -452,15 +450,14 @@ def s11_F_DPC_mstep_decrease(cfg):
     frozen, _ = e_step(
         net, x, y,
         T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
         gamma_hidden=cfg.gamma_hidden, gamma_output=cfg.gamma_output,
     )
 
     def f_dpc(net_):
         return float(shared_free_energy(
-            net_, x, y, y_var, frozen.m_z, frozen.v_z,
-            kappa=1.0,
-            gamma_hidden=cfg.gamma_hidden,
+            net_, x, y, y_var, frozen.m_zs, frozen.v_zs,
+                gamma_hidden=cfg.gamma_hidden,
             gamma_output=cfg.gamma_output,
             include_weight_kl=True,
         ))
@@ -482,54 +479,6 @@ def s11_F_DPC_mstep_decrease(cfg):
     return _bad(f"F_DPC INCREASED: {F_before:.6f} -> {F_after:.6f} (delta {F_after-F_before:.3e})")
 
 
-def s12_legacy_objective_dispatch(cfg):
-    """S12: e_step(objective='pc_free_energy') matches manual objective descent.
-
-    Verifies that objective='pc_free_energy' descends the legacy Eq. 40 scalar
-    with the current initialization. This is dispatch consistency, not a claim
-    that old run numerics are reproduced after predictive latent init.
-    """
-    print("[S12] Legacy objective dispatch (objective='pc_free_energy')")
-    key = jax.random.PRNGKey(13)
-    net = init_network(key, cfg.layer_dims)
-    B = 8
-    rng = np.random.default_rng(13)
-    x = jnp.asarray(rng.uniform(0, 1, (B, cfg.input_dim)).astype(np.float32))
-    y = jnp.zeros((B, cfg.output_dim), dtype=jnp.float32).at[:, 0].set(1.0)
-
-    frozen, _ = e_step(
-        net, x, y,
-        T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
-        objective="pc_free_energy",
-    )
-
-    # Replicate the legacy-objective descent manually from the current init.
-    # `initial_latents` returns tuples of length L_hidden; for the L=1 cfg
-    # used here we index [0] to recover the legacy single-array shape.
-    W = jax.lax.stop_gradient(net)
-    m0_tup, u0_tup = initial_latents(W, x, cfg.v_init)
-    assert len(m0_tup) == 1, "S12 is an L=1 regression test"
-    m0, u0 = m0_tup[0], u0_tup[0]
-
-    def F_of(m, u):
-        return free_energy(W, x, y, m, jnp.exp(u), output_weight=1.0)
-
-    grad_fn = jax.grad(F_of, argnums=(0, 1))
-    m_legacy, u_legacy = m0, u0
-    for _ in range(cfg.T_z):
-        gm, gu = grad_fn(m_legacy, u_legacy)
-        m_legacy = m_legacy - cfg.eta_m * gm
-        u_legacy = clamp_u(u_legacy - cfg.eta_u * gu)
-    v_legacy = jnp.exp(u_legacy)
-
-    err_m = float(jnp.abs(frozen.m_z - m_legacy).max())
-    err_v = float(jnp.abs(frozen.v_z - v_legacy).max())
-    tol = 1e-5
-    if err_m < tol and err_v < tol:
-        return _ok(f"dispatch match: |dm|={err_m:.3e}, |dv|={err_v:.3e}")
-    return _bad(f"dispatch diverged: |dm|={err_m:.3e}, |dv|={err_v:.3e} (tol {tol})")
-
-
 def s13_mstep_gradient_identity(cfg):
     """S13: M-step direction matches -eta * jax.grad(shared_free_energy).
 
@@ -549,15 +498,14 @@ def s13_mstep_gradient_identity(cfg):
     frozen, _ = e_step(
         net, x, y,
         T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
         gamma_hidden=cfg.gamma_hidden, gamma_output=cfg.gamma_output,
     )
 
     def F_of_net(net_):
         return shared_free_energy(
-            net_, x, y, y_var, frozen.m_z, frozen.v_z,
-            kappa=1.0,
-            gamma_hidden=cfg.gamma_hidden,
+            net_, x, y, y_var, frozen.m_zs, frozen.v_zs,
+                gamma_hidden=cfg.gamma_hidden,
             gamma_output=cfg.gamma_output,
             include_weight_kl=True,
         )
@@ -681,8 +629,6 @@ def s15_shared_dpc_target_free_at_fixed_point(cfg):
         T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
         output_weight=0.0,
         y_var=y_var_zero,
-        objective="shared_dpc",
-        kappa=1.0,
     )
 
     err_m = float(jnp.abs(frozen.m_z - m0).max())
@@ -775,9 +721,7 @@ def s17_relu_end_to_end_dispatch(cfg):
       - _mean_predict_from_frozen returns a probability vector summing to 1.
     """
     print("[S17] ReLU end-to-end dispatch")
-    # `replace` resets `activations` to `()` triggering __post_init__'s
-    # legacy fallback `(psi,) = ("relu",)`. Either form works.
-    cfg_relu = replace(cfg, psi="relu", activations=())
+    cfg_relu = replace(cfg, activations=("relu",) * len(cfg.hidden_dims))
     key = jax.random.PRNGKey(18)
     net = init_network(
         key, cfg_relu.layer_dims,
@@ -800,7 +744,7 @@ def s17_relu_end_to_end_dispatch(cfg):
     frozen, e_diag = e_step(
         net, x, y,
         T_z=cfg_relu.T_z, eta_m=cfg_relu.eta_m, eta_u=cfg_relu.eta_u, v_init=cfg_relu.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
     )
     ok = True
     if jnp.all(jnp.isfinite(frozen.m_z)) and jnp.all(jnp.isfinite(frozen.v_z)) and jnp.all(frozen.v_z > 0):
@@ -817,8 +761,8 @@ def s17_relu_end_to_end_dispatch(cfg):
 
     # Shared free energy is a finite scalar.
     F = float(shared_free_energy(
-        net, x, y, y_var, frozen.m_z, frozen.v_z,
-        kappa=1.0, gamma_hidden=cfg_relu.gamma_hidden, gamma_output=cfg_relu.gamma_output,
+        net, x, y, y_var, frozen.m_zs, frozen.v_zs,
+        gamma_hidden=cfg_relu.gamma_hidden, gamma_output=cfg_relu.gamma_output,
         include_weight_kl=True,
     ))
     if math.isfinite(F):
@@ -849,7 +793,6 @@ def s17_relu_end_to_end_dispatch(cfg):
         new_net, x,
         T_z=cfg_relu.eval_T_z_resolved, eta_m=cfg_relu.eval_eta_m_resolved,
         eta_u=cfg_relu.eval_eta_u_resolved, v_init=cfg_relu.eval_v_init_resolved,
-        objective="shared_dpc",
     )
     p_mean = _mean_predict_from_frozen(new_net, frozen_eval)
     row_sums = p_mean.sum(axis=-1)
@@ -871,7 +814,7 @@ def _build_categorical_net(cfg, *, estimator="mean", psi="identity", seed=100):
     """Build a small Network with the categorical output head configured."""
     cfg_cat = replace(
         cfg,
-        psi=psi,
+        activations=(psi,) * len(cfg.hidden_dims),
         output_likelihood="categorical",
         output_estimator=estimator,
     )
@@ -897,8 +840,8 @@ def s18_mean_categorical_loss_correctness(cfg):
     cfg_cat, net = _build_categorical_net(cfg, estimator="mean", seed=130)
     rng = np.random.default_rng(130)
     B = 5
-    m_z = jnp.asarray(rng.normal(0, 0.3, (B, cfg.hidden_dim)).astype(np.float32))
-    v_z = jnp.asarray(rng.uniform(0.01, 0.1, (B, cfg.hidden_dim)).astype(np.float32))
+    m_z = jnp.asarray(rng.normal(0, 0.3, (B, cfg.hidden_dims[0])).astype(np.float32))
+    v_z = jnp.asarray(rng.uniform(0.01, 0.1, (B, cfg.hidden_dims[0])).astype(np.float32))
     y_idx = jnp.asarray(rng.integers(0, cfg_cat.output_dim, size=(B,)), dtype=jnp.int32)
     impl = float(mean_categorical_loss(net, m_z, v_z, y_idx))
 
@@ -932,8 +875,8 @@ def s19_mc_collapses_to_mean(cfg):
 
     rng = np.random.default_rng(131)
     B = 4
-    m_z = jnp.asarray(rng.normal(0, 0.3, (B, cfg.hidden_dim)).astype(np.float32))
-    v_z = jnp.full((B, cfg.hidden_dim), 1e-12, dtype=jnp.float32)
+    m_z = jnp.asarray(rng.normal(0, 0.3, (B, cfg.hidden_dims[0])).astype(np.float32))
+    v_z = jnp.full((B, cfg.hidden_dims[0]), 1e-12, dtype=jnp.float32)
     y_idx = jnp.asarray(rng.integers(0, cfg.output_dim, size=(B,)), dtype=jnp.int32)
     key = jax.random.PRNGKey(231)
     loss_mc = float(mc_categorical_loss(net_det, m_z, v_z, y_idx, key, 256))
@@ -965,7 +908,6 @@ def s20_categorical_e_step_descent(cfg):
         net, x, placeholder_y,
         T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u, v_init=cfg_cat.v_init,
         y_var=placeholder_yvar,
-        objective="shared_dpc", kappa=1.0,
         gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
         y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
     )
@@ -996,7 +938,6 @@ def s21_categorical_output_update_decreases_loss(cfg):
         net, x, placeholder_y,
         T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u, v_init=cfg_cat.v_init,
         y_var=placeholder_yvar,
-        objective="shared_dpc", kappa=1.0,
         gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
         y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
     )
@@ -1067,7 +1008,6 @@ def s22_gaussian_path_byte_identical(cfg):
     loop_net, _, _, _ = batch_step(
         net, x, y_mean, y_var, y_idx,
         jax.random.PRNGKey(123),
-        jnp.float32(1.0),
     )
 
     # Manual replay using e_step + m_step directly (Gaussian-only paths).
@@ -1075,7 +1015,6 @@ def s22_gaussian_path_byte_identical(cfg):
         net, x, y_mean,
         T_z=cfg.T_z, eta_m=cfg.eta_m, eta_u=cfg.eta_u, v_init=cfg.v_init,
         y_var=y_var,
-        objective=cfg.objective, kappa=1.0,
         gamma_hidden=cfg.gamma_hidden, gamma_output=cfg.gamma_output,
         y_idx=y_idx, key=jax.random.split(jax.random.PRNGKey(123), 3)[0],
         mc_samples_train=1,
@@ -1128,7 +1067,6 @@ def s23_categorical_end_to_end_dispatch(cfg):
     new_net, e_diag, m_diag, f_dpc = batch_step(
         net, x, y_mean, y_var, y_idx,
         jax.random.PRNGKey(234),
-        jnp.float32(1.0),
     )
     ok = True
     if new_net.output_likelihood != "categorical" or new_net.output_estimator != "mc":
@@ -1156,7 +1094,6 @@ def s23_categorical_end_to_end_dispatch(cfg):
         eta_m=cfg_cat.eval_eta_m_resolved,
         eta_u=cfg_cat.eval_eta_u_resolved,
         v_init=cfg_cat.eval_v_init_resolved,
-        objective="shared_dpc",
     )
     p_mean = _mean_predict_from_frozen(new_net, frozen_eval)
     p_mc = _mc_predict_from_frozen(new_net, frozen_eval, jax.random.PRNGKey(99), 4)
@@ -1192,7 +1129,7 @@ def s24_categorical_e_step_requires_y_idx(cfg):
             net, x, placeholder_y,
             T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u,
             v_init=cfg_cat.v_init,
-            y_var=placeholder_yvar, objective="shared_dpc", kappa=1.0,
+            y_var=placeholder_yvar,
             # Deliberately NOT passing y_idx, with the default output_weight=1.0.
         )
     except ValueError as err:
@@ -1211,7 +1148,7 @@ def s24_categorical_e_step_requires_y_idx(cfg):
             net, x, placeholder_y,
             T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u,
             v_init=cfg_cat.v_init,
-            y_var=placeholder_yvar, objective="shared_dpc", kappa=1.0,
+            y_var=placeholder_yvar,
             output_weight=0.0,
         )
         _ok("target-free e_step (output_weight=0) accepts y_idx=None")
@@ -1254,7 +1191,7 @@ def s25_lambda_y_threaded_consistently(cfg):
     common = dict(
         T_z=cfg_cat.T_z, eta_m=cfg_cat.eta_m, eta_u=cfg_cat.eta_u,
         v_init=cfg_cat.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
         gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
         y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
     )
@@ -1269,13 +1206,13 @@ def s25_lambda_y_threaded_consistently(cfg):
 
     # (b) shared_energy_terms scales f_out by output_weight.
     se_one = shared_energy_terms(
-        net, x, y_mean, y_var, frozen_lambda.m_z, frozen_lambda.v_z,
+        net, x, y_mean, y_var, frozen_lambda.m_zs, frozen_lambda.v_zs,
         y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
         gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
         output_weight=1.0,
     )
     se_lambda = shared_energy_terms(
-        net, x, y_mean, y_var, frozen_lambda.m_z, frozen_lambda.v_z,
+        net, x, y_mean, y_var, frozen_lambda.m_zs, frozen_lambda.v_zs,
         y_idx=y_idx, key=jax.random.PRNGKey(0), mc_samples_train=1,
         gamma_hidden=cfg_cat.gamma_hidden, gamma_output=cfg_cat.gamma_output,
         output_weight=lambda_y,
@@ -1314,54 +1251,6 @@ def s25_lambda_y_threaded_consistently(cfg):
 # (regression: S26), (b) descend the canonical F_DPC at L>=2 (S27-S28),
 # (c) match the write-up's predictive init and decomposition (S28, S31),
 # and (d) implement the two new delta-method activations correctly (S29-S30).
-
-
-def s26_l1_byte_identity_legacy_vs_canonical(cfg):
-    """S26: BaseConfig built with legacy (hidden_dim, psi) is bit-identical to
-    canonical (hidden_dims, activations) construction.
-
-    Regression test for the multi-layer refactor's backward-compatibility
-    claim. `__post_init__` derives the tuple fields from the legacy scalars
-    when the tuples are empty; this test exercises that path and confirms a
-    full `batch_step` produces identical weights/F_DPC across the two
-    construction routes.
-    """
-    print("[S26] L=1 byte-identity: legacy vs canonical BaseConfig")
-    legacy_cfg = BaseConfig(hidden_dim=64, psi="relu")
-    canon_cfg = BaseConfig(hidden_dims=(64,), activations=("relu",))
-    ok = True
-    if legacy_cfg.hidden_dims == canon_cfg.hidden_dims and legacy_cfg.activations == canon_cfg.activations:
-        _ok(f"both configs resolve to hidden_dims={canon_cfg.hidden_dims}, "
-            f"activations={canon_cfg.activations}")
-    else:
-        return _bad(
-            f"legacy and canonical differ: legacy={legacy_cfg.hidden_dims}/{legacy_cfg.activations}, "
-            f"canonical={canon_cfg.hidden_dims}/{canon_cfg.activations}"
-        )
-    # Build networks under both configs; same seed => identical weights.
-    legacy_net = init_network(
-        jax.random.PRNGKey(26), legacy_cfg.layer_dims,
-        activations=legacy_cfg.activations,
-        init_log_var=legacy_cfg.init_log_var,
-    )
-    canon_net = init_network(
-        jax.random.PRNGKey(26), canon_cfg.layer_dims,
-        activations=canon_cfg.activations,
-        init_log_var=canon_cfg.init_log_var,
-    )
-    max_diff = 0.0
-    for l_leg, l_can in zip(legacy_net.layers, canon_net.layers):
-        max_diff = max(max_diff, float(jnp.abs(l_leg.mu - l_can.mu).max()))
-        max_diff = max(max_diff, float(jnp.abs(l_leg.tau - l_can.tau).max()))
-    if max_diff == 0.0:
-        _ok(f"init_network output identical (max |diff| = {max_diff:.3e})")
-    else:
-        ok &= _bad(f"init_network output differs (max |diff| = {max_diff:.3e})")
-    if legacy_net.activations == canon_net.activations == ("relu",):
-        _ok(f"Network.activations propagated: {legacy_net.activations}")
-    else:
-        ok &= _bad("Network.activations did not propagate equivalently")
-    return ok
 
 
 def _build_multi_layer_net(*, hidden_dims, activations,
@@ -1416,7 +1305,7 @@ def s27_l2_e_step_descent(cfg):
     frozen, e_diag = e_step(
         net, x, y_mean,
         T_z=cfg_l2.T_z, eta_m=cfg_l2.eta_m, eta_u=cfg_l2.eta_u, v_init=cfg_l2.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
     )
     ok = True
     F_trace = np.asarray(e_diag.F_trace)
@@ -1444,7 +1333,6 @@ def s27_l2_e_step_descent(cfg):
     def F_full(m_tup, v_tup):
         return shared_free_energy(
             net, x, y_mean, y_var, m_tup, v_tup,
-            kappa=1.0, gamma_hidden=cfg_l2.gamma_hidden,
             gamma_output=cfg_l2.gamma_output,
             include_weight_kl=False,
         )
@@ -1501,13 +1389,12 @@ def s28_l2_m_step_decreases_f_dpc(cfg):
     frozen, _ = e_step(
         net, x, y_mean,
         T_z=cfg_l2.T_z, eta_m=cfg_l2.eta_m, eta_u=cfg_l2.eta_u, v_init=cfg_l2.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
     )
 
     def f_dpc(n_):
         return float(shared_free_energy(
             n_, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
-            kappa=1.0, gamma_hidden=cfg_l2.gamma_hidden,
             gamma_output=cfg_l2.gamma_output, include_weight_kl=True,
             weight_kl_scale=1.0 / max(cfg_l2.n_train_total, 1) if cfg_l2.n_train_total else 1.0,
         ))
@@ -1520,7 +1407,6 @@ def s28_l2_m_step_decreases_f_dpc(cfg):
     def f_dpc_(n_):
         return float(shared_free_energy(
             n_, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
-            kappa=1.0, gamma_hidden=cfg_l2.gamma_hidden,
             gamma_output=cfg_l2.gamma_output, include_weight_kl=True,
             weight_kl_scale=weight_kl_scale,
         ))
@@ -1691,7 +1577,7 @@ def s31_multi_layer_end_to_end(cfg):
     # End-to-end batch_step via the production loop.
     batch_step = make_batch_step(cfg_l3, N_train=B * 100)
     new_net, e_diag, m_diag, f_dpc = batch_step(
-        net, x, y_mean, y_var, y_idx, jax.random.PRNGKey(311), jnp.float32(1.0)
+        net, x, y_mean, y_var, y_idx, jax.random.PRNGKey(311)
     )
     # Per-layer diagnostics present.
     expected_keys = {"hidden_0", "hidden_1", "hidden_2", "output"}
@@ -1718,7 +1604,6 @@ def s31_multi_layer_end_to_end(cfg):
     frozen_eval = _target_free_frozen(
         new_net, x,
         T_z=cfg_l3.T_z, eta_m=cfg_l3.eta_m, eta_u=cfg_l3.eta_u, v_init=cfg_l3.v_init,
-        objective="shared_dpc", kappa=1.0,
         gamma_hidden=cfg_l3.gamma_hidden, gamma_output=cfg_l3.gamma_output,
     )
     p_mean = _mean_predict_from_frozen(new_net, frozen_eval)
@@ -1735,50 +1620,23 @@ def s31_multi_layer_end_to_end(cfg):
 
 
 def s32_review_regressions(cfg):
-    """S32: regression locks for the three review-found bugs.
+    """S32: regression locks for review-found bugs.
 
-    Bug 1 (P1): legacy CLI / `dataclasses.replace` overrides were silently
-    ignored once BaseConfig's __post_init__ had derived the canonical
-    tuples. We assert that
-        replace(BaseConfig(), hidden_dim=64, psi='relu')
-    re-derives `hidden_dims=(64,), activations=('relu',)` -- the legacy
-    override is honoured.
-
-    Bug 2 (P2): m_step no longer emitted `"hidden"` for L>=2, so
-    downstream logging that reads `m_diag["hidden"]` (in experiments/mnist.py)
-    crashed at epoch end. We assert that an L=2 m_step returns *both*
-    `"hidden_0"` / `"hidden_1"` (per-layer) and an aggregate `"hidden"`
-    alias pointing at the top hidden's diagnostics.
-
-    Bug 3 (P3): the categorical MC output M-step's sample-side activation
+    Bug (P2): the categorical MC output M-step's sample-side activation
     only handled 'relu'; with `--activations relu,tanh` (or `leaky_relu`)
     it silently degraded to identity. We assert that the categorical
     update gradient w.r.t. mu is *non-zero* under the new activations and
     *differs* from what an identity head would produce, locking that the
     M-step objective actually applies the configured activation.
+
+    Bug (P-keys): m_step must emit `"hidden_l"` keys uniformly for every
+    L_hidden value (no L=1 special case, no aggregate alias). We assert
+    the L=2 m_step returns exactly `{"hidden_0", "hidden_1", "output"}`.
     """
-    print("[S32] Regression locks for review-found bugs (P1, P2, P3)")
+    print("[S32] Regression locks for review-found bugs")
     ok = True
 
-    # --- P1 ---
-    base = BaseConfig()
-    replaced = replace(base, hidden_dim=64, psi="relu")
-    if replaced.hidden_dims == (64,) and replaced.activations == ("relu",):
-        _ok("P1: replace(BaseConfig(), hidden_dim=64, psi='relu') honors legacy override")
-    else:
-        ok &= _bad(
-            f"P1: legacy override dropped; got hidden_dims={replaced.hidden_dims}, "
-            f"activations={replaced.activations}"
-        )
-    # And canonical still wins when both are provided.
-    both = BaseConfig(hidden_dim=999, hidden_dims=(256, 128),
-                      psi="tanh", activations=("relu", "tanh"))
-    if both.hidden_dims == (256, 128) and both.activations == ("relu", "tanh"):
-        _ok("P1: canonical tuples win when both legacy and canonical are set")
-    else:
-        ok &= _bad("P1: canonical did not win over legacy")
-
-    # --- P2 ---
+    # --- per-layer m_diag keys ---
     cfg_l2, net_l2 = _build_multi_layer_net(
         hidden_dims=(64, 32), activations=("relu", "identity"), seed=320,
     )
@@ -1790,7 +1648,7 @@ def s32_review_regressions(cfg):
     frozen, _ = e_step(
         net_l2, x, y_mean,
         T_z=cfg_l2.T_z, eta_m=cfg_l2.eta_m, eta_u=cfg_l2.eta_u, v_init=cfg_l2.v_init,
-        y_var=y_var, objective="shared_dpc", kappa=1.0,
+        y_var=y_var,
     )
     _, m_diag = m_step(
         net_l2, frozen, x, y_mean, y_var,
@@ -1800,18 +1658,13 @@ def s32_review_regressions(cfg):
         eta_mu_output=cfg_l2.eta_mu_output, eta_tau_output=cfg_l2.eta_tau_output,
         data_scale=1.0 / B, prior_scale=1.0,
     )
-    expected_keys = {"hidden", "hidden_0", "hidden_1", "output"}
-    if expected_keys.issubset(set(m_diag.keys())):
-        _ok(f"P2: L=2 m_step emits per-layer + 'hidden' aggregate (keys: {sorted(m_diag.keys())})")
+    expected_keys = {"hidden_0", "hidden_1", "output"}
+    if set(m_diag.keys()) == expected_keys:
+        _ok(f"per-layer m_diag keys are exactly {sorted(expected_keys)}")
     else:
         ok &= _bad(
-            f"P2: missing aggregate 'hidden' key in L=2 m_diag; got {sorted(m_diag.keys())}"
+            f"L=2 m_diag keys differ from expected; got {sorted(m_diag.keys())}"
         )
-    # The aggregate alias should equal the top hidden's diag (hidden_1).
-    if m_diag["hidden"] is m_diag["hidden_1"]:
-        _ok("P2: 'hidden' aggregate aliases the top hidden's diagnostics")
-    else:
-        ok &= _bad("P2: 'hidden' aggregate is not the top hidden's diag")
 
     # --- P3 ---
     # Build a categorical-MC net with a non-ReLU top activation; verify the
@@ -1885,7 +1738,6 @@ def main():
         "S9": s9_iterative_m_step(cfg),
         "S10": s10_F_DPC_monotone(cfg),
         "S11": s11_F_DPC_mstep_decrease(cfg),
-        "S12": s12_legacy_objective_dispatch(cfg),
         "S13": s13_mstep_gradient_identity(cfg),
         "S14": s14_predictive_latent_init(cfg),
         "S15": s15_shared_dpc_target_free_at_fixed_point(cfg),
@@ -1899,7 +1751,6 @@ def main():
         "S23": s23_categorical_end_to_end_dispatch(cfg),
         "S24": s24_categorical_e_step_requires_y_idx(cfg),
         "S25": s25_lambda_y_threaded_consistently(cfg),
-        "S26": s26_l1_byte_identity_legacy_vs_canonical(cfg),
         "S27": s27_l2_e_step_descent(cfg),
         "S28": s28_l2_m_step_decreases_f_dpc(cfg),
         "S29": s29_leaky_relu_moment_correctness(cfg),
