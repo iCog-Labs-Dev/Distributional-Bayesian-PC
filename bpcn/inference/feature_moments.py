@@ -95,6 +95,46 @@ def apply_psi_sample(psi: str, z):
     )
 
 
+def sampled_psi_moments(psi: str, m_z, v_z, key, S: int):
+    """Monte-Carlo (m_h, v_h) for psi applied to z ~ N(m_z, v_z).
+
+    Draws reparameterized samples, applies the exact nonlinearity, and
+    returns empirical moments. With a fixed key, gradients flow through
+    `m_z` and `v_z` while the sampled noise stays fixed.
+
+    Parameters
+    ----------
+    psi : str
+        One of {"identity", "relu", "leaky_relu", "tanh"}.
+    m_z, v_z : jax.Array
+        Latent moments, same shape (`[..., d]`).
+    key : jax.Array
+        PRNG key. The caller is responsible for splitting/folding.
+    S : int (static)
+        Number of MC samples. S=32 estimates `(m_h, v_h)` with about
+        `0.18 * std` standard error; raise for tighter estimates.
+
+    Returns
+    -------
+    m_h, v_h : jax.Array, same shape as `m_z`
+        Empirical mean and variance of `psi(z_s)` across the S samples.
+        Bessel's correction is not applied.
+
+    Notes
+    -----
+    Used by `experiments/injection_coupling_probe.py`. It is intentionally
+    separate from production `psi_moments`; training with sampled hidden
+    moments is a separate algorithmic choice.
+    """
+    sigma_z = jnp.sqrt(jnp.maximum(v_z, 0.0))
+    eps = jax.random.normal(key, (S,) + m_z.shape, dtype=m_z.dtype)
+    z_samples = m_z[None] + sigma_z[None] * eps           # [S, ..., d]
+    h_samples = jax.vmap(lambda z: apply_psi_sample(psi, z))(z_samples)
+    m_h = h_samples.mean(axis=0)
+    v_h = h_samples.var(axis=0)
+    return m_h, v_h
+
+
 def psi_moments(psi: str, m_z, v_z):
     """Dispatch (m_z, v_z) through the chosen psi (Eq. 93).
 
