@@ -59,6 +59,15 @@ class EStepDiagnostics(NamedTuple):
     F_trace: jax.Array          # [T_z]   per-iteration objective value (mean over batch)
     F_initial: jax.Array        # scalar  objective at t=0
     F_final: jax.Array          # scalar  objective after T_z steps
+    # Always-populated initial latents (stop-gradient'd tuples of length L_hidden).
+    # These reflect q_lambda^0 = (m0, v0) AFTER `initial_latents` applies any
+    # predictive-disequilibrium perturbation, so callers can compute init-time
+    # per-layer residuals from the exact state the E-step started its descent
+    # from. v_initial = exp(u0). Distinct from `m_initial_trace` /
+    # `u_initial_trace`, which are populated only when `record_per_iter=True`
+    # and may be removed in future cleanups -- prefer `m_initial`/`v_initial`.
+    m_initial: object = None     # Tuple[jax.Array, ...] length L_hidden
+    v_initial: object = None     # Tuple[jax.Array, ...] length L_hidden
     # Optional diagnostic traces. They remain None on the default path.
     # When populated, trace index t stores latents after E-step update t.
     m_trace: object = None       # Optional[Tuple[jax.Array, ...]]
@@ -275,16 +284,23 @@ def e_step(
     m_zs = tuple(jax.lax.stop_gradient(m) for m in m_final)
     v_zs = tuple(jax.lax.stop_gradient(jnp.exp(u)) for u in u_final)
 
+    # Initial latents -- always returned (stop-gradient'd) so the training loop
+    # can compute init-time per-layer residuals from the exact (perturbed or
+    # not) starting state of the E-step, without re-running `initial_latents`.
+    m_initial_sg = tuple(jax.lax.stop_gradient(m) for m in m0)
+    v_initial_sg = tuple(jax.lax.stop_gradient(jnp.exp(u)) for u in u0)
+
     if record_per_iter:
         # Detach traces so diagnostics cannot accidentally carry gradients.
         m_trace_sg = tuple(jax.lax.stop_gradient(m) for m in m_trace_tup)
         u_trace_sg = tuple(jax.lax.stop_gradient(u) for u in u_trace_tup)
-        m_initial_sg = tuple(jax.lax.stop_gradient(m) for m in m0)
         u_initial_sg = tuple(jax.lax.stop_gradient(u) for u in u0)
         diagnostics = EStepDiagnostics(
             F_trace=F_trace,
             F_initial=F_initial,
             F_final=F_trace[-1],
+            m_initial=m_initial_sg,
+            v_initial=v_initial_sg,
             m_trace=m_trace_sg,
             u_trace=u_trace_sg,
             m_initial_trace=m_initial_sg,
@@ -295,5 +311,7 @@ def e_step(
             F_trace=F_trace,
             F_initial=F_initial,
             F_final=F_trace[-1],
+            m_initial=m_initial_sg,
+            v_initial=v_initial_sg,
         )
     return FrozenLatents(m_zs=m_zs, v_zs=v_zs), diagnostics

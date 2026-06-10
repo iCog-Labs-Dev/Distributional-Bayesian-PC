@@ -50,6 +50,12 @@ def _target_free_frozen(
     placeholder_target = jnp.zeros((B, C), dtype=x.dtype)
     if y_var is None:
         y_var = jnp.zeros_like(placeholder_target)
+    # init_perturb_std=0.0 is the default and is set explicitly here to lock
+    # the seed-free target-free eval contract: predictive-disequilibrium init
+    # is a TRAINING-only intervention (write-up Section 8 of
+    # predictive_disequilibrium_initialization_dbpcn.pdf). Target-free
+    # evaluation must always start at the exact predictive fixed point so
+    # model uncertainty is not mixed with init noise.
     frozen, _ = e_step(
         net, x, placeholder_target,
         T_z=T_z, eta_m=eta_m, eta_u=eta_u, v_init=v_init,
@@ -57,6 +63,7 @@ def _target_free_frozen(
         y_var=y_var,
         gamma_hidden=gamma_hidden,
         gamma_output=gamma_output,
+        init_perturb_std=0.0,
     )
     return frozen
 

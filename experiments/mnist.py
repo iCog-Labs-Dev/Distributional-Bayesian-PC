@@ -184,6 +184,14 @@ def parse_args(argv=None):
     g_e.add_argument(
         "--v-init", type=float, default=None,
         help="Minimum latent variance floor used by predictive latent initialization.")
+    g_e.add_argument(
+        "--init-perturb-std", type=float, default=None,
+        help="Predictive-disequilibrium init coefficient c_m "
+             "(predictive_disequilibrium_initialization_dbpcn.pdf, Section 6.1). "
+             "Adds natural-scale mean jitter c_m * sqrt(v_pred) * xi to each "
+             "hidden latent at the start of every training E-step. 0.0 (default) "
+             "= exact predictive init (v2 Eq. 89). Training-only; the seed-free "
+             "target-free eval always uses 0.0.")
 
     g_m = p.add_argument_group("M-step (Algorithm 2; Eqs. 81-82)")
     g_m.add_argument(
@@ -302,7 +310,7 @@ _CFG_FIELDS = (
     "input_dim", "hidden_dims", "hidden_init", "output_init", "init_log_var",
     "activations",
     "alpha_hidden", "alpha_output", "beta_inv_hidden", "beta_inv_output",
-    "T_z", "eta_m", "eta_u", "v_init",
+    "T_z", "eta_m", "eta_u", "v_init", "init_perturb_std",
     "eta_mu_hidden", "eta_tau_hidden", "eta_mu_output", "eta_tau_output",
     "gamma_hidden", "gamma_output", "m_step_iters",
     "target_var", "target_scale",
@@ -423,7 +431,7 @@ def run(
             shuffle_seed=cfg.seed + epoch,
         )):
             batch_key = jax.random.fold_in(epoch_key, bi)
-            net, e_diag, m_diag, f_dpc = batch_step(
+            net, e_diag, m_diag, f_dpc, init_res, freeze_res = batch_step(
                 net,
                 jnp.asarray(batch.x),
                 jnp.asarray(batch.y_mean),
@@ -431,7 +439,10 @@ def run(
                 jnp.asarray(batch.y_idx),
                 batch_key,
             )
-            ep_diag.add(e_diag, m_diag, f_dpc=f_dpc)
+            ep_diag.add(
+                e_diag, m_diag, f_dpc=f_dpc,
+                init_residuals=init_res, freeze_residuals=freeze_res,
+            )
             if (bi + 1) % 20 == 0 or bi == n_batches - 1:
                 last = ep_diag.records[-1]
                 log_fn(
@@ -448,7 +459,9 @@ def run(
             f"[bpcn.mnist] epoch {epoch} done in {elapsed:.1f}s; "
             f"avg F_init={summary['F_initial']:.4f} F_final={summary['F_final']:.4f} "
             f"kl_data({top_hidden})={summary[f'{top_hidden}/kl_data']:.4f} "
-            f"kl_data(out)={summary['output/kl_data']:.4f}"
+            f"kl_data(out)={summary['output/kl_data']:.4f} "
+            f"init/K({top_hidden})={summary.get(f'{top_hidden}/init/K', 0.0):.3e} "
+            f"freeze/K({top_hidden})={summary.get(f'{top_hidden}/freeze/K', 0.0):.3e}"
         )
         epoch_record = {"epoch": epoch, "elapsed_s": elapsed, "summary": summary}
 

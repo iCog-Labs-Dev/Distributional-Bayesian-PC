@@ -364,7 +364,7 @@ def s9_iterative_m_step(cfg):
         data_scale=1.0 / B, prior_scale=1.0 / B,
     )
     batch_step_1 = make_batch_step(cfg1, N_train=B)
-    loop_net_1, _, loop_diag_1, _ = batch_step_1(
+    loop_net_1, _, loop_diag_1, _, _, _ = batch_step_1(
         net, x, y, y_var, y_idx, batch_key
     )
     max_diff = 0.0
@@ -381,7 +381,7 @@ def s9_iterative_m_step(cfg):
 
     cfg3 = replace(cfg, batch_size=B, m_step_iters=3)
     batch_step_3 = make_batch_step(cfg3, N_train=B)
-    _, _, loop_diag_3, _ = batch_step_3(
+    _, _, loop_diag_3, _, _, _ = batch_step_3(
         net, x, y, y_var, y_idx, batch_key
     )
     for name, ld in loop_diag_3.items():
@@ -1005,7 +1005,7 @@ def s22_gaussian_path_byte_identical(cfg):
 
     cfg_for_loop = replace(cfg, batch_size=B, m_step_iters=1)
     batch_step = make_batch_step(cfg_for_loop, N_train=B)
-    loop_net, _, _, _ = batch_step(
+    loop_net, _, _, _, _, _ = batch_step(
         net, x, y_mean, y_var, y_idx,
         jax.random.PRNGKey(123),
     )
@@ -1064,7 +1064,7 @@ def s23_categorical_end_to_end_dispatch(cfg):
     y_var = jnp.full((B, cfg_cat.output_dim), cfg_cat.target_var, dtype=jnp.float32)
 
     batch_step = make_batch_step(cfg_cat, N_train=B)
-    new_net, e_diag, m_diag, f_dpc = batch_step(
+    new_net, e_diag, m_diag, f_dpc, _init_res, _freeze_res = batch_step(
         net, x, y_mean, y_var, y_idx,
         jax.random.PRNGKey(234),
     )
@@ -1576,7 +1576,7 @@ def s31_multi_layer_end_to_end(cfg):
 
     # End-to-end batch_step via the production loop.
     batch_step = make_batch_step(cfg_l3, N_train=B * 100)
-    new_net, e_diag, m_diag, f_dpc = batch_step(
+    new_net, e_diag, m_diag, f_dpc, _init_res, _freeze_res = batch_step(
         net, x, y_mean, y_var, y_idx, jax.random.PRNGKey(311)
     )
     # Per-layer diagnostics present.

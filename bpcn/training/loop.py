@@ -17,7 +17,7 @@ from functools import partial
 import jax
 
 from ..inference.e_step import e_step
-from ..inference.shared_energy import shared_energy_terms
+from ..inference.shared_energy import per_layer_residuals, shared_energy_terms
 from .m_step import m_step
 
 
@@ -62,6 +62,13 @@ def make_batch_step(cfg, N_train: int):
     # Categorical-output extension constants (continuation note Eq. 2/48).
     mc_samples_train = int(cfg.mc_samples_train)
     lambda_y = float(cfg.lambda_y)
+    # Predictive-disequilibrium init coefficient
+    # (predictive_disequilibrium_initialization_dbpcn.pdf, Section 6.1).
+    # 0.0 (default) preserves byte-identical legacy predictive init.
+    # `e_step` auto-splits its own `key` to derive `init_perturb_key` when
+    # this is positive, so the existing `keys_mstep`/`key_snapshot` index
+    # arithmetic does not change.
+    init_perturb_std = float(cfg.init_perturb_std)
 
     @partial(jax.jit, static_argnums=())
     def batch_step(net, x, y_mean, y_var, y_idx, key):
@@ -90,6 +97,23 @@ def make_batch_step(cfg, N_train: int):
             y_idx=y_idx,
             key=key_estep,
             mc_samples_train=mc_samples_train,
+            init_perturb_std=init_perturb_std,
+        )
+
+        # Init-time per-layer residuals: K^l, |e|, |r|, r_pos_frac evaluated at
+        # the (possibly perturbed) starting state of the E-step, BEFORE any
+        # latent descent step. At c_m=0.0 with exact predictive init these are
+        # all ~zero by construction (write-up §3); at c_m>0 they reflect the
+        # `1/2 * c_m^2 + ...` mismatch the seed-persistence probe characterised.
+        init_residuals = per_layer_residuals(
+            net, x, e_diag.m_initial, e_diag.v_initial,
+        )
+        # Freeze-time per-layer residuals: same metrics evaluated at the frozen
+        # latent posterior, AGAINST THE PRE-M-STEP `net`. This is the state the
+        # FIRST M-step iteration actually sees, so freeze/K above noise floor
+        # is the precondition for the tau-data gradient to be operational.
+        freeze_residuals = per_layer_residuals(
+            net, x, frozen.m_zs, frozen.v_zs,
         )
         # M-step: run m_step_iters sequential gradient updates on the SAME
         # frozen latent posterior. Each iteration recomputes (m_p, v_p) from
@@ -143,6 +167,6 @@ def make_batch_step(cfg, N_train: int):
             weight_kl_scale=weight_kl_scale,
             output_weight=lambda_y,
         )
-        return new_net, e_diag, m_diag, f_dpc_terms
+        return new_net, e_diag, m_diag, f_dpc_terms, init_residuals, freeze_residuals
 
     return batch_step

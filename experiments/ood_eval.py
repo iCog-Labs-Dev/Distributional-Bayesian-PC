@@ -152,6 +152,19 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--out-dir", type=str, default="reports/ood_rotated_mnist",
         help="Output directory for the unified comparison.md / comparison.json.",
     )
+    p.add_argument(
+        "--with-layer-residuals", action="store_true",
+        help="Also compute per-hidden-layer wrong-subset residuals (K, |e|, |r|, "
+             "r_pos_frac) at each angle, using the seed-free target-free E-step "
+             "(init_perturb_std=0.0). The wrong subset is defined by MC argmax "
+             "!= y_idx on the rotated inputs (continuation Section 6.6). "
+             "Decisive diagnostic for the perturbed-init confirmation experiment.")
+    p.add_argument(
+        "--wrong-subset-max", type=int, default=None,
+        help="Cap on the number of wrong-subset examples used for the per-layer "
+             "residual computation when --with-layer-residuals is set. "
+             "Default = --batch-size (single fixed-shape trace per angle; "
+             "avoids JIT retracing across angles).")
     return p.parse_args(argv)
 
 
@@ -243,7 +256,8 @@ def _load_run(run_dir: str) -> Tuple[BaseConfig, "Network"]:
 
 def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
                   key: jax.Array, mc_samples: int, batch_size: int,
-                  ece_bins: int) -> Dict[str, float]:
+                  ece_bins: int,
+                  return_arrays: bool = False):
     """Run target-free E-step + MEAN/MC predictives on `(x, y_idx)`; return metrics.
 
     Identical eval geometry to `bpcn.evaluation.predict.evaluate_split`: one
@@ -309,7 +323,7 @@ def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
     ent_mc = -np.sum(p_mc_clip * np.log(p_mc_clip), axis=-1)
     ent_mean = -np.sum(p_mean_clip * np.log(p_mean_clip), axis=-1)
 
-    return {
+    metrics = {
         # MC predictive
         "MC_accuracy": float((pred_mc == y_idx).mean()),
         "MC_nll": float(-log_p_mc.mean()),
@@ -328,6 +342,90 @@ def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
         "H_gap_mean": float((ent_mc - ent_mean).mean()),
         "H_gap_std": float((ent_mc - ent_mean).std()),
         "n": int(N),
+    }
+    if return_arrays:
+        return metrics, p_mc_arr
+    return metrics
+
+
+def _wrong_subset_layer_residuals(net, cfg: BaseConfig,
+                                  x_rot: np.ndarray, p_mc_arr: np.ndarray,
+                                  y_idx: np.ndarray, batch_size: int,
+                                  max_n: int) -> Dict:
+    """Per-hidden-layer K, |e|, |r|, r_pos_frac on the wrong subset.
+
+    Wrong = MC argmax != y_idx, same definition as
+    `experiments/hard_subset_residuals.py:_build_subset_masks` and consistent
+    with continuation Section 6.6 (target-free predictive inference).
+    Uses the seed-free target-free E-step via `_target_free_frozen`
+    (init_perturb_std=0.0 -- locked by `bpcn/evaluation/predict.py` defensive
+    arg) so the residuals reflect the trained checkpoint's intrinsic latent
+    state, not the training-time perturbation.
+
+    To avoid JIT retraces across the 8 OOD angles, the wrong subset is capped
+    to `min(len(wrong), max_n)` examples and (if needed) padded to the next
+    multiple of `batch_size`. Residuals are batch-averaged across the valid
+    (non-pad) examples only.
+
+    Returns
+    -------
+    dict[int, dict] keyed by layer index l, each value
+    `{K, e_abs, r_abs, r_pos_frac, n_wrong, n_used}`.
+    None if the wrong subset is empty.
+    """
+    # Local imports to keep ood_eval importable without these dependencies
+    # under headless eval paths that don't request residuals.
+    from bpcn.evaluation.predict import _target_free_frozen
+    from bpcn.inference.shared_energy import per_layer_residuals as _per_layer_residuals
+
+    pred_mc = p_mc_arr.argmax(axis=-1)
+    wrong_mask = (pred_mc != y_idx)
+    n_wrong = int(wrong_mask.sum())
+    if n_wrong == 0:
+        return None
+    wrong_idx = np.where(wrong_mask)[0]
+    n_used = min(n_wrong, int(max_n))
+    sub_idx = wrong_idx[:n_used]
+    x_w = x_rot[sub_idx]
+    # Pad to a multiple of batch_size so the JIT trace is shape-stable across
+    # angles when n_used is the same constant; the per_layer_residuals helper
+    # returns batch-mean reductions, so we slice to the valid prefix BEFORE
+    # taking moments to keep the averaging honest.
+    pad = (-len(x_w)) % batch_size
+    if pad > 0:
+        x_padded = np.concatenate(
+            [x_w, np.zeros((pad, x_w.shape[1]), dtype=x_w.dtype)],
+            axis=0,
+        )
+    else:
+        x_padded = x_w
+    x_padded_j = jnp.asarray(x_padded)
+    frozen = _target_free_frozen(
+        net, x_padded_j,
+        T_z=int(cfg.eval_T_z_resolved),
+        eta_m=float(cfg.eval_eta_m_resolved),
+        eta_u=float(cfg.eval_eta_u_resolved),
+        v_init=float(cfg.eval_v_init_resolved),
+        gamma_hidden=float(cfg.gamma_hidden),
+        gamma_output=float(cfg.gamma_output),
+    )
+    # Slice the frozen-latent tuples back to the valid prefix so the residual
+    # averages reflect only real wrong-subset examples (pad rows are dummy
+    # zeros and would dilute the means).
+    m_zs_valid = tuple(m[:n_used] for m in frozen.m_zs)
+    v_zs_valid = tuple(v[:n_used] for v in frozen.v_zs)
+    x_valid = x_padded_j[:n_used]
+    residuals = _per_layer_residuals(net, x_valid, m_zs_valid, v_zs_valid)
+    return {
+        l: {
+            "K": float(np.asarray(d["K"])),
+            "e_abs": float(np.asarray(d["e_abs"])),
+            "r_abs": float(np.asarray(d["r_abs"])),
+            "r_pos_frac": float(np.asarray(d["r_pos_frac"])),
+            "n_wrong": n_wrong,
+            "n_used": n_used,
+        }
+        for l, d in residuals.items()
     }
 
 
@@ -404,6 +502,53 @@ def _write_comparison(out_dir: str, runs: List[str], angles: Tuple[float, ...],
         _section("MC ECE",              "MC_ece"),
         _section("MEAN ECE",            "MEAN_ece"),
     ]
+
+    # Optional per-hidden-layer wrong-subset residuals (--with-layer-residuals).
+    # Layout: one section per metric (K / e_abs / r_abs / r_pos_frac), inside
+    # each section one sub-table per run with rows=layer indices and cols=angles.
+    # Only emit if at least one (run, angle) cell carries the residual payload.
+    def _layer_keys_present():
+        for run in runs:
+            for a in angles:
+                cell = results[run][a].get("wrong_subset_layer_residuals")
+                if cell:
+                    return sorted(cell.keys())
+        return None
+
+    layer_keys = _layer_keys_present()
+    if layer_keys is not None:
+        parts.append(
+            "## Wrong-subset per-hidden-layer residuals\n\n"
+            "Per-hidden-layer K (mean inclusion-KL), |e|, |r|, r_pos_frac on the "
+            "MC-wrong subset (pred_mc ≠ y_idx), evaluated at the seed-free "
+            "target-free E-step fixed point (init_perturb_std=0.0 — locked by "
+            "`bpcn/evaluation/predict.py`). Decisive for whether the σ² that "
+            "moved during training carries data-conditional epistemic mass "
+            "rather than just tracking the training-time perturbation noise.\n"
+        )
+
+        def _residual_section(title: str, key: str) -> str:
+            cols = ["run", "layer"] + [f"{a:g}°" for a in angles]
+            rows = []
+            for run in runs:
+                for lk in layer_keys:
+                    row = {"run": run, "layer": lk}
+                    for a in angles:
+                        cell = results[run][a].get("wrong_subset_layer_residuals")
+                        if cell and lk in cell:
+                            row[f"{a:g}°"] = _fmt(cell[lk].get(key, float("nan")))
+                        else:
+                            row[f"{a:g}°"] = ""
+                    rows.append(row)
+            return f"### {title}\n\n{_markdown_table(rows, cols)}\n"
+
+        parts.extend([
+            _residual_section("K (mean per-unit inclusion-KL)", "K"),
+            _residual_section("|e| (mean abs mean-error)",       "e_abs"),
+            _residual_section("|r| (mean abs variance residual)", "r_abs"),
+            _residual_section("r_pos_frac",                      "r_pos_frac"),
+        ])
+
     with open(os.path.join(out_dir, "comparison.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(parts))
 
@@ -441,16 +586,37 @@ def main(argv=None) -> int:
         print(f"  loaded test split: x={x_id.shape}, n={len(y_idx)}")
 
         results[run_name] = {}
+        wrong_subset_max = (
+            int(args.wrong_subset_max)
+            if args.wrong_subset_max is not None
+            else int(args.batch_size)
+        )
         for angle in angles:
             t_a = time.time()
             x_rot = _rotate_mnist_flat(x_id, angle)
-            metrics = _eval_dataset(
+            eval_out = _eval_dataset(
                 net, cfg, x_rot, y_idx,
                 key=jax.random.PRNGKey(int(args.eval_key)),
                 mc_samples=int(args.mc_samples),
                 batch_size=int(args.batch_size),
                 ece_bins=int(args.ece_bins),
+                return_arrays=bool(args.with_layer_residuals),
             )
+            if args.with_layer_residuals:
+                metrics, p_mc_arr = eval_out
+                wrong_res = _wrong_subset_layer_residuals(
+                    net, cfg, x_rot, p_mc_arr, y_idx,
+                    batch_size=int(args.batch_size),
+                    max_n=wrong_subset_max,
+                )
+                # Stored as {"layer_l": {...}} so JSON serialisation handles
+                # string keys cleanly without int-key coercion at load time.
+                metrics["wrong_subset_layer_residuals"] = (
+                    {f"layer_{l}": d for l, d in wrong_res.items()}
+                    if wrong_res is not None else None
+                )
+            else:
+                metrics = eval_out
             results[run_name][angle] = metrics
             print(
                 f"  angle={angle:>5g}°  "

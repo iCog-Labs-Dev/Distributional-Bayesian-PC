@@ -60,6 +60,16 @@ class BaseConfig:
     eta_u: float = 0.05                      # latent log-var learning rate
     v_init: float = 1e-2                     # minimum initial latent variance floor
 
+    # --- Predictive-disequilibrium init ---------------------------------------
+    # Reference: predictive_disequilibrium_initialization_dbpcn.pdf, Section 6.1.
+    # Natural-scale mean jitter applied AFTER predictive feedforward init:
+    #   m_l <- m_pred + init_perturb_std * sqrt(v_pred) * xi,  xi ~ N(0, I).
+    # Training-only intervention. Eval (`_target_free_frozen`) always uses 0.0
+    # so model uncertainty is not mixed with init noise.
+    # 0.0 (default) = exact predictive init (v2 Eq. 89), byte-identical to the
+    # pre-perturbation training path. Set to 0.1 for the confirmation run.
+    init_perturb_std: float = 0.0
+
     # --- M-step (Algorithm 2, Eqs. 81-82, plan U4-U5) ------------------------
     eta_mu_hidden: float = 1e-3              # hidden mean learning rate
     eta_tau_hidden: float = 1e-4             # hidden log-var learning rate
@@ -133,6 +143,10 @@ class BaseConfig:
         for name in ("eta_m", "eta_u", "v_init"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}")
+        if self.init_perturb_std < 0:
+            raise ValueError(
+                f"init_perturb_std must be >= 0, got {self.init_perturb_std}"
+            )
         for name in ("eval_eta_m", "eval_eta_u", "eval_v_init"):
             val = getattr(self, name)
             if val is not None and val <= 0:

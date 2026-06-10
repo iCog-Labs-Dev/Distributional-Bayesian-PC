@@ -19,7 +19,8 @@ class EpochDiagnostics:
     def __init__(self):
         self.records: List[Dict] = []
 
-    def add(self, e_diag, m_diag, f_dpc=None):
+    def add(self, e_diag, m_diag, f_dpc=None,
+            init_residuals=None, freeze_residuals=None):
         """Append one minibatch's diagnostics to the per-epoch record.
 
         Parameters
@@ -32,6 +33,14 @@ class EpochDiagnostics:
             When the loop returns these (always in current implementation),
             they are recorded as F_out, F_trans_dpc, F_weight_kl. When None
             (legacy single-stage runs), the entries are omitted.
+        init_residuals, freeze_residuals : dict[int, dict] or None
+            Per-hidden-layer distributional residual diagnostics from
+            `bpcn.inference.shared_energy.per_layer_residuals`. When provided,
+            emit per-layer keys `hidden_l/{init,freeze}/{K,e_abs,r_abs,r_pos_frac}`
+            so the predictive-disequilibrium confirmation experiment can read
+            the t=0 and t=T_z metrics across all hidden layers. When None,
+            those keys are omitted (legacy training runs that don't return the
+            new dicts remain consumable).
         """
         rec = {
             "F_initial": float(np.asarray(e_diag.F_initial)),
@@ -45,6 +54,18 @@ class EpochDiagnostics:
             rec["F_weight_kl"] = float(np.asarray(f_dpc.f_weight_kl))
             # Total F_DPC = F_out + F_trans-DPC + F_weight-KL (extension Eq. 12).
             rec["F_DPC_total"] = rec["F_out"] + rec["F_trans_dpc"] + rec["F_weight_kl"]
+        if init_residuals is not None:
+            for l, d in init_residuals.items():
+                rec[f"hidden_{l}/init/K"] = float(np.asarray(d["K"]))
+                rec[f"hidden_{l}/init/e_abs"] = float(np.asarray(d["e_abs"]))
+                rec[f"hidden_{l}/init/r_abs"] = float(np.asarray(d["r_abs"]))
+                rec[f"hidden_{l}/init/r_pos_frac"] = float(np.asarray(d["r_pos_frac"]))
+        if freeze_residuals is not None:
+            for l, d in freeze_residuals.items():
+                rec[f"hidden_{l}/freeze/K"] = float(np.asarray(d["K"]))
+                rec[f"hidden_{l}/freeze/e_abs"] = float(np.asarray(d["e_abs"]))
+                rec[f"hidden_{l}/freeze/r_abs"] = float(np.asarray(d["r_abs"]))
+                rec[f"hidden_{l}/freeze/r_pos_frac"] = float(np.asarray(d["r_pos_frac"]))
         for name, ld in m_diag.items():
             rec[f"{name}/kl_data"] = float(np.asarray(ld.kl_data))
             rec[f"{name}/kl_data_before"] = float(np.asarray(ld.kl_data_before))

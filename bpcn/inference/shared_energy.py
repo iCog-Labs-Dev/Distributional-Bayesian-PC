@@ -143,6 +143,52 @@ def _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train):
         )
 
 
+def per_layer_residuals(net: Network, x, m_zs, v_zs):
+    """Per-hidden-layer distributional residual diagnostics.
+
+    For each `l in 0..net.L_hidden - 1`, computes the local Gaussian
+    inclusion-KL terms used by the M-step gradient (v2 Eqs. 65/66/68;
+    extension Eqs. 15/16/19) at the given (m_zs, v_zs) state, with weights
+    held fixed.
+
+    Reuses `_layer_presynaptic_moments`, `moment_forward`, and `gaussian_kl`,
+    so the arithmetic is identical to `experiments/hard_subset_residuals.py
+    ::_compute_residuals` and to `bpcn/training/m_step.py::update_layer` --
+    just packaged as a per-batch diagnostic.
+
+    Returns
+    -------
+    dict[int, dict[str, jax.Array]]
+        `{l: {"K": mean per-unit KL, "e_abs": mean(|e|),
+              "r_abs": mean(|r|), "r_pos_frac": mean(r > 0)}}`.
+        All values are scalar JAX arrays. `K` is mean *per-unit per-example*
+        (matches the `hidden_l/kl_data` convention in `LayerDiagnostics`);
+        if you want the layer-sum-batch-mean form used by `_trans_dpc_sum`,
+        multiply by `m_zs[l].shape[-1]`.
+
+    Notes
+    -----
+    Intended to be called twice per minibatch in the training loop:
+      - at init time with `(e_diag.m_initial, e_diag.v_initial)` to log
+        `hidden_l/init/{K,e_abs,r_abs,r_pos_frac}`,
+      - at freeze time with `(frozen.m_zs, frozen.v_zs)` -- against the
+        pre-M-step `net` -- to log the same metrics under `hidden_l/freeze/...`.
+    Also reused by `experiments/ood_eval.py` to log per-angle wrong-subset
+    residuals at the target-free fixed point.
+    """
+    out = {}
+    for l in range(net.L_hidden):
+        m_p, v_p = _hidden_layer_predictive(net, x, m_zs, v_zs, l)
+        kl = gaussian_kl(m_z=m_zs[l], v_z=v_zs[l], m_p=m_p, v_p=v_p)
+        out[l] = {
+            "K": kl.kl.mean(),
+            "e_abs": jnp.abs(kl.e).mean(),
+            "r_abs": jnp.abs(kl.r).mean(),
+            "r_pos_frac": (kl.r > 0).mean().astype(kl.kl.dtype),
+        }
+    return out
+
+
 def _trans_dpc_sum(net: Network, x, m_zs, v_zs) -> jax.Array:
     """Sum over l = 0..L_hidden-1 of the local Gaussian inclusion KL
     (extension Eq. 12 second sum; extension Eqs. 13-15).
