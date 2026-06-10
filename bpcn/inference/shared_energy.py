@@ -41,16 +41,25 @@ import jax.numpy as jnp
 from ..models.network import Network
 from ..models.moments import moment_forward
 from ..losses.distributional_kl import gaussian_kl
-from ..losses.weight_kl import gaussian_weight_kl
+from ..losses.weight_kl import gaussian_weight_kl, gaussian_weight_kl_components
 from .feature_moments import psi_moments
 from .categorical_output import categorical_output_loss
 
 
 class SharedEnergyTerms(NamedTuple):
-    """Decomposed shared-energy components (extension Eq. 72)."""
+    """Decomposed shared-energy components (extension Eq. 72).
+
+    The `f_weight_kl_mu` and `f_weight_kl_var` fields decompose `f_weight_kl`
+    into its mean-displacement and variance/log-ratio components per
+    `DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf` §5 step 2. Their sum
+    matches `f_weight_kl` to machine precision (algebraic identity from
+    `gaussian_weight_kl_components`).
+    """
     f_out: jax.Array         # scalar, per-batch mean of output local KL
     f_trans_dpc: jax.Array   # scalar, per-batch mean of hidden transition local KL
     f_weight_kl: jax.Array   # scalar, Sum_l gamma_l KL(q(W_l) || p(W_l)); NO batch averaging
+    f_weight_kl_mu: jax.Array  # scalar, mu-term component of f_weight_kl
+    f_weight_kl_var: jax.Array  # scalar, var-term (log-ratio) component of f_weight_kl
 
 
 def _layer_presynaptic_moments(net: Network, x, m_zs, v_zs, l: int):
@@ -116,6 +125,45 @@ def _weight_kl_total(
     output = net.layers[-1]
     Kw_o = gaussian_weight_kl(output.mu, output.tau, output.alpha).sum()
     return weight_kl_scale * (gamma_hidden * Kw_hidden + gamma_output * Kw_o)
+
+
+def _weight_kl_total_decomposed(
+    net: Network,
+    gamma_hidden: float,
+    gamma_output: float,
+    *,
+    weight_kl_scale: float = 1.0,
+):
+    """Decomposed Sum_l gamma_l KL(q(W_l) || p(W_l)) — mirrors `_weight_kl_total`
+    but returns `(total, mu_total, var_total)` per
+    `DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf` §5 step 2.
+
+    `mu_total + var_total == total` by algebraic identity of
+    `gaussian_weight_kl_components`. Each component is summed across all
+    weights (hidden layers each weighted by `gamma_hidden`, output by
+    `gamma_output`) and scaled by `weight_kl_scale` (typically 1/N_train for
+    per-data-point convention).
+    """
+    L_hidden = net.L_hidden
+    dtype = net.layers[0].mu.dtype
+    mu_total = jnp.zeros((), dtype=dtype)
+    var_total = jnp.zeros((), dtype=dtype)
+    for l in range(L_hidden):
+        layer = net.layers[l]
+        mu_term, var_term = gaussian_weight_kl_components(
+            layer.mu, layer.tau, layer.alpha
+        )
+        mu_total = mu_total + gamma_hidden * mu_term.sum()
+        var_total = var_total + gamma_hidden * var_term.sum()
+    output = net.layers[-1]
+    mu_term_o, var_term_o = gaussian_weight_kl_components(
+        output.mu, output.tau, output.alpha
+    )
+    mu_total = mu_total + gamma_output * mu_term_o.sum()
+    var_total = var_total + gamma_output * var_term_o.sum()
+    mu_total = weight_kl_scale * mu_total
+    var_total = weight_kl_scale * var_total
+    return mu_total + var_total, mu_total, var_total
 
 
 def _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train):
@@ -246,10 +294,16 @@ def shared_energy_terms(
     f_out_raw = _output_term(net, y_mean, y_var, y_idx, m_zs[-1], v_zs[-1], key, mc_samples_train)
     output_weight_arr = jnp.asarray(output_weight, dtype=f_out_raw.dtype)
     f_out = output_weight_arr * f_out_raw
-    f_weight_kl = _weight_kl_total(
+    f_weight_kl, f_weight_kl_mu, f_weight_kl_var = _weight_kl_total_decomposed(
         net, gamma_hidden, gamma_output, weight_kl_scale=weight_kl_scale
     )
-    return SharedEnergyTerms(f_out=f_out, f_trans_dpc=f_trans_dpc, f_weight_kl=f_weight_kl)
+    return SharedEnergyTerms(
+        f_out=f_out,
+        f_trans_dpc=f_trans_dpc,
+        f_weight_kl=f_weight_kl,
+        f_weight_kl_mu=f_weight_kl_mu,
+        f_weight_kl_var=f_weight_kl_var,
+    )
 
 
 def shared_free_energy(

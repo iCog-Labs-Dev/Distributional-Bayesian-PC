@@ -53,6 +53,14 @@ class BaseConfig:
     alpha_output: float = 1.0
     beta_inv_hidden: float = 1e-2            # residual variance B_l^{-1}  (fixed)
     beta_inv_output: float = 1e-2
+    # --- Layerwise matched prior (DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf §5)
+    # When `alpha_scheme != "constant"`, the `alpha_hidden`, `alpha_output`,
+    # and `init_log_var` fields above are IGNORED -- per-layer α_l and
+    # init_log_var_l are derived from fan_in_l = layer_dims[l]:
+    #   matched_he:     α²_l = 2/fan_in_l, σ²_w,0,l = α²_l   (ReLU networks)
+    #   matched_xavier: α²_l = 1/fan_in_l, σ²_w,0,l = α²_l   (tanh / identity networks)
+    # `constant` (default) preserves byte-identical legacy behaviour.
+    alpha_scheme: str = "constant"
 
     # --- E-step (Algorithm 1, plan U2-U3) ------------------------------------
     T_z: int = 8                             # inner E-step iterations
@@ -146,6 +154,12 @@ class BaseConfig:
         if self.init_perturb_std < 0:
             raise ValueError(
                 f"init_perturb_std must be >= 0, got {self.init_perturb_std}"
+            )
+        _ALLOWED_ALPHA_SCHEMES = ("constant", "matched_he", "matched_xavier")
+        if self.alpha_scheme not in _ALLOWED_ALPHA_SCHEMES:
+            raise ValueError(
+                f"alpha_scheme must be one of {_ALLOWED_ALPHA_SCHEMES}, "
+                f"got {self.alpha_scheme!r}"
             )
         for name in ("eval_eta_m", "eval_eta_u", "eval_v_init"):
             val = getattr(self, name)

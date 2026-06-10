@@ -20,7 +20,8 @@ class EpochDiagnostics:
         self.records: List[Dict] = []
 
     def add(self, e_diag, m_diag, f_dpc=None,
-            init_residuals=None, freeze_residuals=None):
+            init_residuals=None, freeze_residuals=None,
+            weight_kl_initial=None):
         """Append one minibatch's diagnostics to the per-epoch record.
 
         Parameters
@@ -31,16 +32,22 @@ class EpochDiagnostics:
         f_dpc : SharedEnergyTerms or None
             Decomposed F_DPC components after the M-step (extension Eq. 72).
             When the loop returns these (always in current implementation),
-            they are recorded as F_out, F_trans_dpc, F_weight_kl. When None
-            (legacy single-stage runs), the entries are omitted.
+            they are recorded as F_out, F_trans_dpc, F_weight_kl, plus the
+            decomposed `F_weight_kl_mu` / `F_weight_kl_var` per
+            `DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf` §5 step 2.
+            When None (legacy single-stage runs), the entries are omitted.
         init_residuals, freeze_residuals : dict[int, dict] or None
             Per-hidden-layer distributional residual diagnostics from
             `bpcn.inference.shared_energy.per_layer_residuals`. When provided,
-            emit per-layer keys `hidden_l/{init,freeze}/{K,e_abs,r_abs,r_pos_frac}`
-            so the predictive-disequilibrium confirmation experiment can read
-            the t=0 and t=T_z metrics across all hidden layers. When None,
-            those keys are omitted (legacy training runs that don't return the
-            new dicts remain consumable).
+            emit per-layer keys `hidden_l/{init,freeze}/{K,e_abs,r_abs,r_pos_frac}`.
+        weight_kl_initial : float or None
+            Initial (pre-training) value of F_weight_kl in per-data-point
+            scale. When provided AND `f_dpc` is provided, emit the centred
+            `F_weight_kl_delta = F_weight_kl_current - weight_kl_initial` key
+            per the continuation note's recommended diagnostic
+            (centred ΔKL is interpretable as Bayesian complexity added by
+            training, where raw KL is dominated by the prior-vs-init scale
+            mismatch). When None, the delta key is omitted.
         """
         rec = {
             "F_initial": float(np.asarray(e_diag.F_initial)),
@@ -52,8 +59,14 @@ class EpochDiagnostics:
             rec["F_out"] = float(np.asarray(f_dpc.f_out))
             rec["F_trans_dpc"] = float(np.asarray(f_dpc.f_trans_dpc))
             rec["F_weight_kl"] = float(np.asarray(f_dpc.f_weight_kl))
+            # Decomposed weight-KL components (continuation note §5 step 2).
+            # Sum-identity: F_weight_kl_mu + F_weight_kl_var = F_weight_kl.
+            rec["F_weight_kl_mu"] = float(np.asarray(f_dpc.f_weight_kl_mu))
+            rec["F_weight_kl_var"] = float(np.asarray(f_dpc.f_weight_kl_var))
             # Total F_DPC = F_out + F_trans-DPC + F_weight-KL (extension Eq. 12).
             rec["F_DPC_total"] = rec["F_out"] + rec["F_trans_dpc"] + rec["F_weight_kl"]
+            if weight_kl_initial is not None:
+                rec["F_weight_kl_delta"] = rec["F_weight_kl"] - float(weight_kl_initial)
         if init_residuals is not None:
             for l, d in init_residuals.items():
                 rec[f"hidden_{l}/init/K"] = float(np.asarray(d["K"]))

@@ -165,6 +165,14 @@ def parse_args(argv=None):
         "--alpha-output", type=float, default=None,
         help="Prior scale alpha_y for output weights (Eq. 27).")
     g_prior.add_argument(
+        "--alpha-scheme", type=str, default=None,
+        choices=["constant", "matched_he", "matched_xavier"],
+        help="Layerwise weight-prior scaling scheme (DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf §5). "
+             "'constant' (default) uses --alpha-hidden / --alpha-output / --init-log-var as passed. "
+             "'matched_he' sets per-layer α²_l = σ²_w,0,l = 2/fan_in_l (ReLU networks). "
+             "'matched_xavier' sets α²_l = σ²_w,0,l = 1/fan_in_l (tanh/identity). "
+             "Under matched_*, --alpha-hidden / --alpha-output / --init-log-var are IGNORED.")
+    g_prior.add_argument(
         "--beta-inv-hidden", type=float, default=None,
         help="Residual variance beta_1^{-1} (Eq. 24, fixed per A4).")
     g_prior.add_argument(
@@ -309,7 +317,7 @@ _CFG_FIELDS = (
     "classes", "batch_size",
     "input_dim", "hidden_dims", "hidden_init", "output_init", "init_log_var",
     "activations",
-    "alpha_hidden", "alpha_output", "beta_inv_hidden", "beta_inv_output",
+    "alpha_hidden", "alpha_output", "alpha_scheme", "beta_inv_hidden", "beta_inv_output",
     "T_z", "eta_m", "eta_u", "v_init", "init_perturb_std",
     "eta_mu_hidden", "eta_tau_hidden", "eta_mu_output", "eta_tau_output",
     "gamma_hidden", "gamma_output", "m_step_iters",
@@ -381,21 +389,43 @@ def run(
     log_fn(f"[bpcn.mnist] Initializing network {cfg.layer_dims} ...")
     key = jax.random.PRNGKey(cfg.seed)
     key, init_key = jax.random.split(key)
+    # ALWAYS build a fresh pre-training network from (init_key, cfg) -- it is
+    # used by the F_weight_kl baseline below regardless of whether we are
+    # resuming. JAX random draws are deterministic given the same seed and
+    # cfg, so this network is bit-identical to the original training's init
+    # state. Under a resume, `net` is then replaced by `initial_net` so the
+    # training loop continues from the checkpoint, but the F_weight_kl
+    # baseline is preserved as the *pre-training* value (write-up §5 step 2:
+    # "ΔF_weight_kl(t) = F_weight_kl(t) − F_weight_kl(0)" must reference
+    # F_weight_kl(0) at t=0, not at the resume point).
+    fresh_init_net = init_network(
+        init_key,
+        layer_dims=cfg.layer_dims,
+        alpha_hidden=cfg.alpha_hidden,
+        alpha_output=cfg.alpha_output,
+        beta_inv_hidden=cfg.beta_inv_hidden,
+        beta_inv_output=cfg.beta_inv_output,
+        init_log_var=cfg.init_log_var,
+        hidden_init=cfg.hidden_init,
+        output_init=cfg.output_init,
+        activations=cfg.activations,
+        output_likelihood=cfg.output_likelihood,
+        output_estimator=cfg.output_estimator,
+        alpha_scheme=cfg.alpha_scheme,
+    )
     if initial_net is None:
-        net = init_network(
-            init_key,
-            layer_dims=cfg.layer_dims,
-            alpha_hidden=cfg.alpha_hidden,
-            alpha_output=cfg.alpha_output,
-            beta_inv_hidden=cfg.beta_inv_hidden,
-            beta_inv_output=cfg.beta_inv_output,
-            init_log_var=cfg.init_log_var,
-            hidden_init=cfg.hidden_init,
-            output_init=cfg.output_init,
-            activations=cfg.activations,
-            output_likelihood=cfg.output_likelihood,
-            output_estimator=cfg.output_estimator,
-        )
+        net = fresh_init_net
+        if cfg.alpha_scheme != "constant":
+            # Surface per-layer α / σ²_w,0 derived from fan_in so the matched-prior
+            # scheme is loud in the run output (continuation note §5 step 1).
+            per_layer_alpha = [float(lr.alpha) for lr in net.layers]
+            per_layer_sigma2 = [float(lr.tau[0, 0]) for lr in net.layers]
+            log_fn(
+                f"[bpcn.mnist]   alpha_scheme={cfg.alpha_scheme!r}: per-layer α "
+                f"= {[round(a, 5) for a in per_layer_alpha]}, "
+                f"init τ = {[round(t, 4) for t in per_layer_sigma2]} "
+                f"(α_hidden/output and init_log_var fields IGNORED under matched scheme)"
+            )
     else:
         net = initial_net
         log_fn(
@@ -416,6 +446,26 @@ def run(
     # from the eval `key` split below. Folded per (epoch, batch) so a resumed
     # run reproduces the same MC draws.
     train_base_key = jax.random.PRNGKey(cfg.seed + 1)
+
+    # Initial (pre-training) F_weight_kl in per-data-point scale. Always
+    # computed from `fresh_init_net` (the freshly-initialised network for the
+    # current cfg + seed), NOT from `net` — under a resumed run, `net` is the
+    # checkpoint state, but the baseline must remain F_weight_kl(0) at
+    # pre-training initialisation so the centred diagnostic
+    # ΔF_weight_kl(t) = F_weight_kl(t) − F_weight_kl(0)
+    # (DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf §5 step 2) stays
+    # continuous across resumes. JAX's random draws are deterministic, so
+    # `fresh_init_net` is bit-identical to the original training's
+    # pre-training state given the same seed + cfg.
+    from bpcn.inference.shared_energy import _weight_kl_total_decomposed
+    weight_kl_initial = float(_weight_kl_total_decomposed(
+        fresh_init_net, gamma_hidden=cfg.gamma_hidden, gamma_output=cfg.gamma_output,
+        weight_kl_scale=1.0 / float(N_train),
+    )[0])
+    log_fn(
+        f"[bpcn.mnist]   F_weight_kl baseline at init = {weight_kl_initial:.4f} nats/batch "
+        f"(per-data-point scale; from fresh-init net, preserved across resumes)"
+    )
 
     for epoch in range(start_epoch, cfg.epochs + 1):
         ep_diag = EpochDiagnostics()
@@ -442,6 +492,7 @@ def run(
             ep_diag.add(
                 e_diag, m_diag, f_dpc=f_dpc,
                 init_residuals=init_res, freeze_residuals=freeze_res,
+                weight_kl_initial=weight_kl_initial,
             )
             if (bi + 1) % 20 == 0 or bi == n_batches - 1:
                 last = ep_diag.records[-1]
@@ -462,6 +513,15 @@ def run(
             f"kl_data(out)={summary['output/kl_data']:.4f} "
             f"init/K({top_hidden})={summary.get(f'{top_hidden}/init/K', 0.0):.3e} "
             f"freeze/K({top_hidden})={summary.get(f'{top_hidden}/freeze/K', 0.0):.3e}"
+        )
+        # Decomposed weight-KL diagnostic (continuation note §5 step 2).
+        log_fn(
+            f"[bpcn.mnist] epoch {epoch} F_weight_kl="
+            f"{summary.get('F_weight_kl', 0.0):.4f}  "
+            f"(μ={summary.get('F_weight_kl_mu', 0.0):.4f}  "
+            f"var={summary.get('F_weight_kl_var', 0.0):.4f}  "
+            f"Δ={summary.get('F_weight_kl_delta', 0.0):+.4f})  "
+            f"F_DPC={summary.get('F_DPC_total', 0.0):.4f}"
         )
         epoch_record = {"epoch": epoch, "elapsed_s": elapsed, "summary": summary}
 
@@ -583,6 +643,7 @@ def _load_checkpoint(cfg: BaseConfig, checkpoint_dir: str):
         activations=cfg.activations,
         output_likelihood=cfg.output_likelihood,
         output_estimator=cfg.output_estimator,
+        alpha_scheme=cfg.alpha_scheme,
     )
 
     weights = np.load(weights_path)

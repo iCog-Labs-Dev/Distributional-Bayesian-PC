@@ -212,9 +212,23 @@ def m_step(
                        softmax NLL (continuation Eqs. 21/27). The hidden
                        layer's `update_layer(...)` call is unchanged in
                        either mode.
+
+    NOTE on `alpha_hidden` / `alpha_output` kwargs: these are accepted for
+    backward compatibility but IGNORED here -- the prior gradient is
+    sourced from each Layer's own `alpha` field (set at network
+    initialization). This is required so the M-step descends the SAME
+    objective as the F_DPC diagnostic reports under any `alpha_scheme`:
+    under `matched_he` / `matched_xavier` the per-layer α_l differs by
+    fan_in_l, and using the scalar kwargs here would silently desynchronise
+    the M-step gradient from the logged F_weight_kl
+    (DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf §5 step 1 self-
+    consistency). Pre-`alpha_scheme` callers passed `alpha_hidden=1.0`
+    matching the constant prior; with the matched schemes the Layer-side
+    α is the only source of truth.
     """
     L_hidden = net.L_hidden
     output = net.layers[-1]
+    del alpha_hidden, alpha_output  # noqa: F841 -- see NOTE above; sourced from layer.alpha
 
     # Per-layer hidden M-step (v2 Section 6.4 / Algorithm 2; continuation
     # Section 6.1 retains this loop unchanged under the categorical extension).
@@ -235,7 +249,7 @@ def m_step(
             net.layers[l],
             M=M_l, V=V_l,
             m_z=frozen.m_zs[l], v_z=frozen.v_zs[l],
-            alpha=alpha_hidden, gamma=gamma_hidden,
+            alpha=net.layers[l].alpha, gamma=gamma_hidden,
             eta_mu=eta_mu_hidden, eta_tau=eta_tau_hidden,
             data_scale=data_scale, prior_scale=prior_scale,
         )
@@ -253,7 +267,7 @@ def m_step(
             output,
             M=M_out, V=V_out,
             m_z=y_mean, v_z=y_var,
-            alpha=alpha_output, gamma=gamma_output,
+            alpha=output.alpha, gamma=gamma_output,
             eta_mu=eta_mu_output, eta_tau=eta_tau_output,
             data_scale=data_scale, prior_scale=prior_scale,
         )
@@ -271,7 +285,7 @@ def m_step(
             output, frozen, y_idx, key,
             estimator=net.output_estimator,
             S=int(mc_samples_train),
-            alpha=alpha_output,
+            alpha=output.alpha,
             gamma=gamma_output,
             eta_mu=eta_mu_output,
             eta_tau=eta_tau_output,

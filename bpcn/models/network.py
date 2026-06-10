@@ -14,6 +14,7 @@ before it enters layer l+1. With L_hidden == 1 this collapses to a single
 psi between the one hidden latent and the output, matching the legacy
 single-layer architecture.
 """
+import math
 from typing import NamedTuple, Tuple
 import jax
 
@@ -108,6 +109,7 @@ def init_network(
     activations: Tuple[str, ...] = ("identity",),
     output_likelihood: str = "gaussian",
     output_estimator: str = "mean",
+    alpha_scheme: str = "constant",
 ) -> Network:
     """Initialize a network from a list of layer widths.
 
@@ -118,10 +120,14 @@ def init_network(
         L_hidden = len(layer_dims) - 2.
     alpha_hidden, alpha_output : float
         Prior scales (v2 Eq. 27). Shared across all hidden layers.
+        IGNORED when `alpha_scheme != "constant"` (per-layer α derived
+        from fan_in -- see `alpha_scheme` below).
     beta_inv_hidden, beta_inv_output : float
         Residual variances (v2 Eq. 24, assumption A4). Shared across hidden layers.
     init_log_var : float
         Initial tau = log sigma_0^2 (v2 Eq. 99).
+        IGNORED when `alpha_scheme != "constant"` (per-layer init_log_var
+        derived to match σ²_w,0,l = α²_l).
     activations : tuple of str
         Per-layer feature maps psi_l (Section 4.5; v2 Eq. 21). Must have
         length == L_hidden. Each entry is one of
@@ -129,6 +135,16 @@ def init_network(
     output_likelihood, output_estimator : str
         Output-boundary configuration (categorical_output_dbpcn_continuation.pdf).
         Defaults preserve the I3 Gaussian-logit head.
+    alpha_scheme : str (default "constant")
+        Weight-prior scaling scheme (DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf §5).
+        - "constant": all layers use `alpha_hidden` / `alpha_output` and
+          `init_log_var` as passed; legacy behaviour.
+        - "matched_he": for each layer i, α²_i = 2/fan_in_i, σ²_{w,0,i} = α²_i
+          (i.e. init_log_var_i = log(2/fan_in_i)). Appropriate for ReLU stacks.
+        - "matched_xavier": α²_i = 1/fan_in_i, σ²_{w,0,i} = α²_i. Appropriate
+          for tanh / identity stacks.
+        Under "matched_*", `alpha_hidden`, `alpha_output`, `init_log_var`
+        are ignored (per-layer values derived from `fan_in`).
     """
     if len(layer_dims) < 3:
         raise ValueError(
@@ -140,6 +156,25 @@ def init_network(
             f"activations length ({len(activations)}) must equal L_hidden "
             f"({L_hidden}); got activations={activations}, layer_dims={layer_dims}"
         )
+    _ALLOWED_ALPHA_SCHEMES = ("constant", "matched_he", "matched_xavier")
+    if alpha_scheme not in _ALLOWED_ALPHA_SCHEMES:
+        raise ValueError(
+            f"alpha_scheme must be one of {_ALLOWED_ALPHA_SCHEMES}, got {alpha_scheme!r}"
+        )
+
+    # Derive per-layer alpha and init_log_var. Under the matched schemes the
+    # passed-in `alpha_hidden` / `alpha_output` / `init_log_var` are ignored
+    # in favour of `α²_l = σ²_w,0,l = c / fan_in_l` per the continuation note.
+    # Number of linear layers = L_hidden + 1 (hidden_0..hidden_{L-1} + output).
+    n_layers = L_hidden + 1
+    if alpha_scheme == "constant":
+        layer_alphas = [float(alpha_hidden)] * L_hidden + [float(alpha_output)]
+        layer_init_log_vars = [float(init_log_var)] * n_layers
+    else:
+        c = 2.0 if alpha_scheme == "matched_he" else 1.0
+        # Linear layer i has fan_in = layer_dims[i] (the input dimensionality).
+        layer_alphas = [math.sqrt(c / float(layer_dims[i])) for i in range(n_layers)]
+        layer_init_log_vars = [math.log(c / float(layer_dims[i])) for i in range(n_layers)]
 
     keys = jax.random.split(key, len(layer_dims) - 1)
     layers = []
@@ -151,10 +186,10 @@ def init_network(
                 keys[i],
                 d_out,
                 d_in,
-                alpha=alpha_hidden,
+                alpha=layer_alphas[i],
                 beta_inv=beta_inv_hidden,
                 init_kind=hidden_init,
-                init_log_var=init_log_var,
+                init_log_var=layer_init_log_vars[i],
             )
         )
     # Output layer maps d_L -> d_y (layers[L_hidden])
@@ -163,10 +198,10 @@ def init_network(
             keys[-1],
             layer_dims[-1],
             layer_dims[-2],
-            alpha=alpha_output,
+            alpha=layer_alphas[-1],
             beta_inv=beta_inv_output,
             init_kind=output_init,
-            init_log_var=init_log_var,
+            init_log_var=layer_init_log_vars[-1],
         )
     )
     return Network(
