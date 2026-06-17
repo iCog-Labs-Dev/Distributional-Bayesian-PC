@@ -1,65 +1,30 @@
-"""Distributional M-step (Algorithm 2): explicit closed-form Eqs. 81-82.
+"""Distributional M-step """
 
-References (write-up: distributional_predictive_coding_v2.pdf):
-- Section 4.6, Algorithm 2 (Section 6.4).
-- Eqs. 60-61: predictive moments.
-- Eq. 66: e = m_z - m_p.
-- Eq. 68: r = v_z + e^2 - v_p.
-- Eq. 81: gradient w.r.t. mu_ij = (N/B) sum_n [ e_ni M_nj / v_p,ni
-                                              + r_ni mu_ij V_nj / v_p,ni^2 ]
-                                  - gamma * mu_ij / alpha^2.
-- Eq. 82: gradient w.r.t. tau_ij = (N/B) sum_n [ r_ni * sigma^2_ij * H^(2)_nj / (2 v_p,ni^2) ]
-                                   - (gamma/2)(sigma^2_ij / alpha^2 - 1).
-
-References (extension: shared_energy_dbpcn_extension.pdf):
-- Eqs. 47, 54: algebraically identical to Eqs. 81, 82 above (verified by S13).
-
-Assumption I5 (plan): we implement Eqs. 81-82 explicitly, NOT via autodiff,
-so the learning rule is exactly the distributional projection from the
-write-up.
-
-SCALING NOTE.  Eq. 81 in the write-up is the gradient of the FULL-DATA loss
-estimated from a minibatch: the (N/B) prefactor converts the batch sum into
-an unbiased estimator of the full-data sum. We refactor the same gradient
-into the standard SGD form, which is equivalent up to a learning-rate
-rescaling:
-
-    Eq. 81 form  (full-data scale):   eta_full *  [ (N/B) Sum_b (...) - gamma  * mu/alpha^2 ]
-    SGD form    (per-data-point):     eta_sgd  *  [ (1/B) Sum_b (...) - (gamma/N) * mu/alpha^2 ]
-
-with eta_full = eta_sgd / N. We use the SGD form so that eta values live in
-the conventional 1e-3 range, but the underlying update is exactly Eq. 81.
-
-The two scales are exposed as `data_scale` (default 1/B) and `prior_scale`
-(default 1/N) so a caller can choose either convention. Setting
-(data_scale, prior_scale) = (N/B, 1) recovers Eq. 81 verbatim.
-
-The output layer (W_y) uses the SAME update with the target taken as the
-Gaussian-logit observation (m_z = y_mean, v_z = y_var)  (assumption I3).
-Its presynaptic feature is psi_1(z^1), with moments propagated through
-`psi_moments` (Section 4.5; default psi="identity").
-"""
 from typing import NamedTuple, Tuple
 import jax
 import jax.numpy as jnp
 
-from ..models.layer import Layer
-from ..utils.safe_math import floor_v, clamp_tau
-from ..inference.feature_moments import psi_moments
-from ..inference.categorical_output import categorical_output_update
+from bpcn.models.layer import Layer
+from bpcn.utils.safe_math import floor_v, clamp_tau
+from bpcn.inference.feature_moments import psi_moments
+from bpcn.inference.categorical_output import categorical_output_update
 
 
 class LayerDiagnostics(NamedTuple):
-    kl_data: jax.Array        # scalar: post-update mean per-unit KL(q* || q_pred)
-    kl_data_before: jax.Array # scalar: pre-update mean per-unit KL for this step
-    kl_data_after: jax.Array  # scalar: post-update mean per-unit KL for this step
-    kl_data_delta: jax.Array  # scalar: kl_data_after - kl_data_before for this step
-    kl_data_loop_before: jax.Array # scalar: pre-update KL before the first inner M-step
-    kl_data_loop_after: jax.Array  # scalar: post-update KL after the final inner M-step
-    kl_data_loop_delta: jax.Array  # scalar: full inner-loop KL change
-    kl_weight: jax.Array      # scalar: mean per-weight KL(q(W) || p(W))
-    grad_mu_norm: jax.Array
-    grad_tau_norm: jax.Array
+    kl_data: jax.Array        # post-update mean per-unit KL(q* || q_pred)
+    kl_data_before: jax.Array #  pre-update mean per-unit KL for this step
+    kl_data_after: jax.Array  # post-update mean per-unit KL for this step
+    kl_data_delta: jax.Array  # kl_data_after - kl_data_before for this step
+    kl_data_loop_before: jax.Array #  pre-update KL before the first inner M-step
+    kl_data_loop_after: jax.Array  #  post-update KL after the final inner M-step
+    kl_data_loop_delta: jax.Array  #  full inner-loop KL change
+    kl_weight: jax.Array      # mean per-weight KL(q(W) || p(W))
+    grad_mu_norm: jax.Array            #  ‖g_μ‖ (total, data + prior)
+    grad_tau_norm: jax.Array           #  ‖g_τ‖ (total, data + prior)
+    grad_mu_data_norm: jax.Array
+    grad_mu_prior_norm: jax.Array
+    grad_tau_data_norm: jax.Array
+    grad_tau_prior_norm: jax.Array
     mean_sigma2: jax.Array
     var_residual_pos_frac: jax.Array   # fraction of units with r > 0
     components: dict                   # variance decomposition diagnostics
@@ -78,23 +43,20 @@ def update_layer(
     eta_tau: float,
     data_scale: float,
     prior_scale: float,
+    gamma_mu_override=None,
 ) -> Tuple[Layer, LayerDiagnostics]:
-    """Apply Eqs. 81-82 to one layer for one minibatch.
+    """Apply a single M-step update to a layer's parameters.
 
-    Parameters
-    ----------
-    data_scale : float
-        Multiplier on the batch sum in the data term. Conventional choices:
-        - 1/B   : SGD-on-per-data-point loss (default in BaseConfig).
-        - N/B   : recovers Eq. 81 letter-for-letter (full-data estimator).
-    prior_scale : float
-        Multiplier on the KL-to-prior term. Conventional choices:
-        - 1/N   : prior weight in per-data-point view (matched to data_scale=1/B).
-        - 1     : recovers Eq. 81 letter-for-letter (matched to data_scale=N/B).
+    This performs a gradient-ascent step on the negative KL objective for a
+    single fully-connected layer given frozen presynaptic/postsynaptic
+    moments. It computes predictive moments, distributional error
+    quantities, data and prior gradients for both the weight means (mu)
+    and log-variances (tau), and applies learning-rate-scaled updates.
     """
     B = M.shape[0]
     sigma2 = jnp.exp(layer.tau)                            # [d_out, p_in]
-    # ----- predictive moments (Eqs. 60-61) -----
+    
+    #  predictive moments 
     m_p = M @ layer.mu.T                                   # [B, d_out]
     propagated = V @ (layer.mu ** 2).T                     # [B, d_out]
     H2 = M ** 2 + V                                        # [B, p_in]
@@ -102,32 +64,31 @@ def update_layer(
     v_p = layer.beta_inv[None, :] + propagated + epistemic # [B, d_out]
     v_p_safe = floor_v(v_p)
 
-    # ----- distributional error quantities (Eqs. 66, 68) -----
+    # distributional error quantities
     e = m_z - m_p                                          # [B, d_out]
     r = v_z + e * e - v_p                                  # [B, d_out]
 
     inv_vp  = 1.0 / v_p_safe
     inv_vp2 = inv_vp * inv_vp
 
-    # ----- data terms of Eqs. 81-82 (batch sum, scaled by data_scale) -----
     g_mu_data_1 = jnp.einsum("bi,bj->ij", e * inv_vp, M)
     g_mu_data_2 = layer.mu * jnp.einsum("bi,bj->ij", r * inv_vp2, V)
     g_mu_data = data_scale * (g_mu_data_1 + g_mu_data_2)
 
     g_tau_data = data_scale * sigma2 * jnp.einsum("bi,bj->ij", 0.5 * r * inv_vp2, H2)
 
-    # ----- prior KL terms (Eqs. 81 second line, 82 second line) -----
-    g_mu_prior  = - prior_scale * gamma * layer.mu / (alpha * alpha)
+    gamma_mu_eff = gamma if gamma_mu_override is None else gamma_mu_override
+    g_mu_prior  = - prior_scale * gamma_mu_eff * layer.mu / (alpha * alpha)
     g_tau_prior = - prior_scale * 0.5 * gamma * (sigma2 / (alpha * alpha) - 1.0)
 
     g_mu  = g_mu_data  + g_mu_prior
     g_tau = g_tau_data + g_tau_prior
 
-    # ----- gradient ascent on -KL (so we ADD the gradient of the objective) -----
+    # gradient ascent on -KL (so we ADD the gradient of the objective)
     new_mu  = layer.mu  + eta_mu  * g_mu
     new_tau = clamp_tau(layer.tau + eta_tau * g_tau)
 
-    # ----- diagnostics -----
+    # diagnostics
     v_p_floor = floor_v(v_p)
     kl_data_before = 0.5 * (jnp.log(v_p_floor) - jnp.log(floor_v(v_z))
                             + (v_z + e * e) / v_p_floor - 1.0).mean()
@@ -156,6 +117,10 @@ def update_layer(
         kl_weight=kl_weight,
         grad_mu_norm=jnp.sqrt((g_mu ** 2).sum()),
         grad_tau_norm=jnp.sqrt((g_tau ** 2).sum()),
+        grad_mu_data_norm=jnp.sqrt((g_mu_data ** 2).sum()),
+        grad_mu_prior_norm=jnp.sqrt((g_mu_prior ** 2).sum()),
+        grad_tau_data_norm=jnp.sqrt((g_tau_data ** 2).sum()),
+        grad_tau_prior_norm=jnp.sqrt((g_tau_prior ** 2).sum()),
         mean_sigma2=sigma2_new.mean(),
         var_residual_pos_frac=(new_r > 0).mean(),
         components=dict(
@@ -193,14 +158,15 @@ def m_step(
     eta_tau_output: float,
     data_scale: float,
     prior_scale: float,
-    # Categorical-output kwargs (continuation note). Consumed only when
-    # `net.output_likelihood == "categorical"`; harmless under "gaussian".
     y_idx=None,
     key=None,
     mc_samples_train: int = 1,
     lambda_y: float = 1.0,
+    gamma_mu_hidden=None,
+    gamma_mu_output=None,
 ):
-    """One full M-step for the base BPCN (L_hidden hidden layers + 1 output).
+    """
+    One full M-step for the base BPCN (L_hidden hidden layers + 1 output).
 
     `data_scale`, `prior_scale` -- see update_layer.
 
@@ -209,34 +175,13 @@ def m_step(
                        (y_mean, y_var) as the frozen target.
     - "categorical" -> jax.grad-based update on lambda_y * F_out + gamma_y
                        * KL(q(W_y)||p(W_y)), where F_out is the MEAN or MC
-                       softmax NLL (continuation Eqs. 21/27). The hidden
-                       layer's `update_layer(...)` call is unchanged in
-                       either mode.
-
-    NOTE on `alpha_hidden` / `alpha_output` kwargs: these are accepted for
-    backward compatibility but IGNORED here -- the prior gradient is
-    sourced from each Layer's own `alpha` field (set at network
-    initialization). This is required so the M-step descends the SAME
-    objective as the F_DPC diagnostic reports under any `alpha_scheme`:
-    under `matched_he` / `matched_xavier` the per-layer α_l differs by
-    fan_in_l, and using the scalar kwargs here would silently desynchronise
-    the M-step gradient from the logged F_weight_kl
-    (DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf §5 step 1 self-
-    consistency). Pre-`alpha_scheme` callers passed `alpha_hidden=1.0`
-    matching the constant prior; with the matched schemes the Layer-side
-    α is the only source of truth.
+                       softmax NLL. The hidden layer's `update_layer(...)` call 
+                       is unchanged in either mode.
     """
     L_hidden = net.L_hidden
     output = net.layers[-1]
-    del alpha_hidden, alpha_output  # noqa: F841 -- see NOTE above; sourced from layer.alpha
+    del alpha_hidden, alpha_output  
 
-    # Per-layer hidden M-step (v2 Section 6.4 / Algorithm 2; continuation
-    # Section 6.1 retains this loop unchanged under the categorical extension).
-    # For each hidden layer l in 0..L_hidden-1:
-    #   - presynaptic moments: (x, 0) if l==0 (v2 Eq. 94), else psi_{l-1}(z^l)
-    #     (v2 Eq. 21 / Section 4.5).
-    #   - postsynaptic target: frozen.m_zs[l], frozen.v_zs[l] (stop-gradient'd
-    #     in the E-step output).
     new_hiddens = []
     hidden_diags = {}
     for l in range(L_hidden):
@@ -252,14 +197,14 @@ def m_step(
             alpha=net.layers[l].alpha, gamma=gamma_hidden,
             eta_mu=eta_mu_hidden, eta_tau=eta_tau_hidden,
             data_scale=data_scale, prior_scale=prior_scale,
+            gamma_mu_override=gamma_mu_hidden,
         )
         new_hiddens.append(new_layer)
         # Per-layer diagnostics key: "hidden_l" for every layer (uniform
         # indexing across all L_hidden values).
         hidden_diags[f"hidden_{l}"] = diag
 
-    # Output-layer update. Presynaptic feature for the output uses psi_L on
-    # the *top* hidden latent (continuation Section 4 / Eq. 16).
+    # Output-layer update. Presynaptic feature for the output uses psi_L on the *top* hidden latent.
     if net.output_likelihood == "gaussian":
         # Output layer target = (y_mean, y_var) [Gaussian-logit; assumption I3].
         M_out, V_out = psi_moments(net.activations[-1], frozen.m_zs[-1], frozen.v_zs[-1])
@@ -270,9 +215,10 @@ def m_step(
             alpha=output.alpha, gamma=gamma_output,
             eta_mu=eta_mu_output, eta_tau=eta_tau_output,
             data_scale=data_scale, prior_scale=prior_scale,
+            gamma_mu_override=gamma_mu_output,
         )
     elif net.output_likelihood == "categorical":
-        # Categorical softmax head (continuation Eqs. 43-45 / Section 6.2).
+        # Categorical softmax head.
         # `categorical_output_update` consumes only the top latent
         # (frozen.m_z / frozen.v_z via the backward-compat properties).
         if y_idx is None:
@@ -293,6 +239,7 @@ def m_step(
             prior_scale=prior_scale,
             lambda_y=lambda_y,
             psi=net.activations[-1],
+            gamma_mu_override=gamma_mu_output,
         )
     else:
         raise ValueError(

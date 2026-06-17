@@ -1,24 +1,10 @@
-"""BPCN network: stack of L hidden Bayesian-PC layers + Bayesian output layer.
+"""BPCN network: stack of L hidden Bayesian-PC layers + Bayesian output layer."""
 
-References (write-up: distributional_predictive_coding_v2.pdf):
-- Eq. 7: hierarchy z^0, z^1, ..., z^L with z^0 = x clamped.
-- Eq. 17 / Eq. 34: generative model
-    p(W, Z, Y|X) = p(W) prod_n [p(y_n | z^L, W_y) prod_l p(z^l | z^{l-1}, W_l)].
-- Eq. 21 / Section 4.5: presynaptic feature h^{l-1} = psi_{l-1}(z^{l-1});
-  per-layer activations propagate moments through `psi_moments`.
-- Section 3.1: output likelihood Eq. 25 (Gaussian) or Eq. 26 (categorical).
-
-For multi-layer support: `Network.activations` is a tuple of length L_hidden.
-`activations[l]` is the feature map applied to z^{l+1} (output of layer l)
-before it enters layer l+1. With L_hidden == 1 this collapses to a single
-psi between the one hidden latent and the output, matching the legacy
-single-layer architecture.
-"""
 import math
 from typing import NamedTuple, Tuple
 import jax
 
-from .layer import Layer, init_layer
+from bpcn.models.layer import Layer, init_layer
 
 
 class Network(NamedTuple):
@@ -28,34 +14,12 @@ class Network(NamedTuple):
     ----------
     layers : tuple of Layer
         Hidden layers (length L_hidden) followed by the output layer.
-        `layers[-1]` is the output layer W_y. Length is L_hidden + 1.
     activations : tuple of str
-        Per-layer feature maps psi_l between consecutive layers
-        (Section 4.5; v2 Eq. 21). Length equals L_hidden. `activations[l]`
-        is the activation applied to the output of `layers[l]` before it
-        is fed into `layers[l+1]`. For L_hidden == 1, this is the single
-        psi between the one hidden latent and the output layer. Choices:
         - "identity" : pass-through (Section 4.5 simplest case).
         - "relu"     : ReLU with delta-method moment propagation.
         - "leaky_relu": Leaky ReLU (alpha=0.01) with delta-method.
         - "tanh"     : tanh with delta-method.
-    output_likelihood : str
-        Form of the output-boundary likelihood. See
-        `categorical_output_dbpcn_continuation.pdf` for the categorical
-        variant. One of:
-        - "gaussian"    (default): I3 Gaussian-logit head, output term is
-                        the inclusion-KL between N(y_mean, y_var) and the
-                        Gaussian predictive at the top layer (extension Eq. 12).
-        - "categorical" : Bayesian softmax head
-                        p(y=c|z^L, W_y) = softmax(W_y psi_L(z^L))_c
-                        (continuation Eq. 1/18). Output term is the
-                        categorical NLL averaged over `output_estimator`.
-    output_estimator : str
-        Categorical F_out estimator. Only consulted when
-        `output_likelihood == "categorical"`. One of:
-        - "mean" : posterior-mean classifier ell^mean (continuation Eq. 21).
-        - "mc"   : Monte Carlo categorical NLL ell^MC (continuation Eq. 27)
-                   via reparameterized output weights and top latents.
+    output_likelihood : str : gaussian | categorical
     """
     layers: Tuple[Layer, ...]
     activations: Tuple[str, ...] = ("identity",)
@@ -65,10 +29,6 @@ class Network(NamedTuple):
     @property
     def L_hidden(self) -> int:
         return len(self.layers) - 1
-
-    @property
-    def output_layer(self) -> Layer:
-        return self.layers[-1]
 
 
 # Register Network as a JAX pytree where the string-and-tuple-of-string
@@ -91,7 +51,8 @@ def _network_unflatten(aux_data, children):
         output_estimator=output_estimator,
     )
 
-
+# Register the flatten and unflatten functions with JAX. This allows JAX to treat Network as a pytree, which is necessary for
+# using JAX transformations like grad, vmap, etc.
 jax.tree_util.register_pytree_node(Network, _network_flatten, _network_unflatten)
 
 
@@ -110,41 +71,24 @@ def init_network(
     output_likelihood: str = "gaussian",
     output_estimator: str = "mean",
     alpha_scheme: str = "constant",
+    init_log_var_offset: float = 0.0,
 ) -> Network:
     """Initialize a network from a list of layer widths.
 
-    Parameters
-    ----------
     layer_dims : (d_0, d_1, ..., d_L, d_y)
-        d_0 = input dim, d_1..d_L = hidden latent dims, d_y = output dim.
-        L_hidden = len(layer_dims) - 2.
     alpha_hidden, alpha_output : float
-        Prior scales (v2 Eq. 27). Shared across all hidden layers.
-        IGNORED when `alpha_scheme != "constant"` (per-layer α derived
-        from fan_in -- see `alpha_scheme` below).
+        Prior scales.same across all hidden layers. Output layer can have a different scale.
     beta_inv_hidden, beta_inv_output : float
         Residual variances (v2 Eq. 24, assumption A4). Shared across hidden layers.
     init_log_var : float
-        Initial tau = log sigma_0^2 (v2 Eq. 99).
-        IGNORED when `alpha_scheme != "constant"` (per-layer init_log_var
-        derived to match σ²_w,0,l = α²_l).
     activations : tuple of str
-        Per-layer feature maps psi_l (Section 4.5; v2 Eq. 21). Must have
-        length == L_hidden. Each entry is one of
-        {"identity", "relu", "leaky_relu", "tanh"}.
     output_likelihood, output_estimator : str
-        Output-boundary configuration (categorical_output_dbpcn_continuation.pdf).
-        Defaults preserve the I3 Gaussian-logit head.
+        Output-boundary configuration
     alpha_scheme : str (default "constant")
-        Weight-prior scaling scheme (DBPCN/dbpcn_weight_kl_sigma2_continuation.pdf §5).
-        - "constant": all layers use `alpha_hidden` / `alpha_output` and
-          `init_log_var` as passed; legacy behaviour.
-        - "matched_he": for each layer i, α²_i = 2/fan_in_i, σ²_{w,0,i} = α²_i
-          (i.e. init_log_var_i = log(2/fan_in_i)). Appropriate for ReLU stacks.
-        - "matched_xavier": α²_i = 1/fan_in_i, σ²_{w,0,i} = α²_i. Appropriate
-          for tanh / identity stacks.
-        Under "matched_*", `alpha_hidden`, `alpha_output`, `init_log_var`
-        are ignored (per-layer values derived from `fan_in`).
+        Weight-prior scaling scheme.
+    init_log_var_offset : float (default 0.0)
+        Additive offset applied to the per-HIDDEN-layer init τ after the
+        `alpha_scheme` derivation. Output layer init τ is NOT offset.
     """
     if len(layer_dims) < 3:
         raise ValueError(
@@ -162,10 +106,7 @@ def init_network(
             f"alpha_scheme must be one of {_ALLOWED_ALPHA_SCHEMES}, got {alpha_scheme!r}"
         )
 
-    # Derive per-layer alpha and init_log_var. Under the matched schemes the
-    # passed-in `alpha_hidden` / `alpha_output` / `init_log_var` are ignored
-    # in favour of `α²_l = σ²_w,0,l = c / fan_in_l` per the continuation note.
-    # Number of linear layers = L_hidden + 1 (hidden_0..hidden_{L-1} + output).
+    # Derive per-layer alpha and init_log_var.
     n_layers = L_hidden + 1
     if alpha_scheme == "constant":
         layer_alphas = [float(alpha_hidden)] * L_hidden + [float(alpha_output)]
@@ -175,6 +116,11 @@ def init_network(
         # Linear layer i has fan_in = layer_dims[i] (the input dimensionality).
         layer_alphas = [math.sqrt(c / float(layer_dims[i])) for i in range(n_layers)]
         layer_init_log_vars = [math.log(c / float(layer_dims[i])) for i in range(n_layers)]
+
+    # Apply init_log_var_offset to HIDDEN layers only.
+    if init_log_var_offset != 0.0:
+        for i in range(L_hidden):
+            layer_init_log_vars[i] = layer_init_log_vars[i] + float(init_log_var_offset)
 
     keys = jax.random.split(key, len(layer_dims) - 1)
     layers = []

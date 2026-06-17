@@ -1,24 +1,16 @@
-"""Algorithm 3: BPCN training loop driver.
-
-References (write-up: distributional_predictive_coding_v2.pdf):
-- Section 6.5 Algorithm 3.
-- Section 6.7 stopping / diagnostics.
-
-References (extension: shared_energy_dbpcn_extension.pdf):
-- Section 6.3 Algorithm 3: shared-energy training loop.
-- Eq. 12: F_DPC, the canonical shared free energy descended each batch.
-- Eq. 72: F_out + F_trans-DPC + F_weight-KL decomposition (logged per batch).
+"""
+BPCN training loop driver.
 
 The per-batch step is jit-compiled with the hyperparameter constants closed
 over so JAX can fuse the E-step and M-step into a single graph (they still
-do NOT share gradients -- see plan section 6.5).
+do NOT share gradients.
 """
 from functools import partial
 import jax
 
-from ..inference.e_step import e_step
-from ..inference.shared_energy import per_layer_residuals, shared_energy_terms
-from .m_step import m_step
+from bpcn.inference.e_step import e_step
+from bpcn.inference.shared_energy import per_layer_residuals, shared_energy_terms
+from bpcn.training.m_step import m_step
 
 
 def _with_loop_kl_summary(first_diag, final_diag):
@@ -31,25 +23,13 @@ def _with_loop_kl_summary(first_diag, final_diag):
 
 
 def make_batch_step(cfg, N_train: int):
-    """Build a jit-compiled function batch_step(net, x, y_mean, y_var, y_idx, key) -> BatchOutcome.
-
-    Uses the SGD-per-data-point scaling convention (see training/m_step.py
-    docstring):
-        data_scale  = 1/B
-        prior_scale = 1/N_train
-    so that eta values live in the conventional 1e-3 range. Mathematically
-    equivalent to Eq. 81 with eta rescaled by 1/N_train.
-
-    Returns `(new_net, e_diag, m_diag, f_dpc_terms)` per batch. `f_dpc_terms`
-    is the post-M-step decomposition of F_DPC (extension Eq. 72).
+    """
+    Build a jit-compiled function
+    batch_step(net, x, y_mean, y_var, y_idx, key) -> BatchOutcome.
+    Uses the SGD-per-data-point scaling convention
     """
     data_scale = 1.0 / float(cfg.batch_size)
     prior_scale = 1.0 / float(N_train)
-    # F_DPC diagnostic must use the same per-data-point scale as the M-step's
-    # gradient. Data terms f_out/f_trans_dpc are already batch means (1/B);
-    # the weight KL gets the matching 1/N_train multiplier so the assembled
-    # F_DPC reflects the scalar the M-step descended. See
-    # bpcn/inference/shared_energy.py weight_kl_scale docstring.
     weight_kl_scale = 1.0 / float(N_train)
 
     m_step_iters = int(cfg.m_step_iters)
@@ -59,31 +39,28 @@ def make_batch_step(cfg, N_train: int):
     # Capture cfg constants in the closure so JAX treats them as static.
     gamma_hidden = float(cfg.gamma_hidden)
     gamma_output = float(cfg.gamma_output)
+    # Decoupled γ_μ overrides
+    gamma_mu_hidden = (
+        float(cfg.gamma_mu_hidden) if cfg.gamma_mu_hidden is not None else None
+    )
+    gamma_mu_output = (
+        float(cfg.gamma_mu_output) if cfg.gamma_mu_output is not None else None
+    )
     # Categorical-output extension constants (continuation note Eq. 2/48).
     mc_samples_train = int(cfg.mc_samples_train)
     lambda_y = float(cfg.lambda_y)
     # Predictive-disequilibrium init coefficient
-    # (predictive_disequilibrium_initialization_dbpcn.pdf, Section 6.1).
-    # 0.0 (default) preserves byte-identical legacy predictive init.
-    # `e_step` auto-splits its own `key` to derive `init_perturb_key` when
-    # this is positive, so the existing `keys_mstep`/`key_snapshot` index
-    # arithmetic does not change.
     init_perturb_std = float(cfg.init_perturb_std)
 
     @partial(jax.jit, static_argnums=())
     def batch_step(net, x, y_mean, y_var, y_idx, key):
-        # Split the batch key into (E-step key, M-step keys, F_DPC-snapshot
-        # key). M-step inner iters get fresh randomness independent of the
-        # E-step's MC samples.
+        # Split the batch key into (E-step key, M-step keys, F_DPC-snapshot key).
         n_keys = 2 + m_step_iters
         keys = jax.random.split(key, n_keys)
         key_estep = keys[0]
         keys_mstep = keys[1:1 + m_step_iters]
         key_snapshot = keys[-1]
-        # `output_weight=lambda_y` keeps the E-step's output-term weight in
-        # sync with the M-step's `lambda_y * F_out` (continuation Eq. 2/48).
-        # Under Gaussian mode lambda_y defaults to 1.0 so legacy behaviour
-        # is unchanged.
+
         frozen, e_diag = e_step(
             net, x, y_mean,
             T_z=cfg.T_z,
@@ -102,25 +79,16 @@ def make_batch_step(cfg, N_train: int):
 
         # Init-time per-layer residuals: K^l, |e|, |r|, r_pos_frac evaluated at
         # the (possibly perturbed) starting state of the E-step, BEFORE any
-        # latent descent step. At c_m=0.0 with exact predictive init these are
-        # all ~zero by construction (write-up §3); at c_m>0 they reflect the
-        # `1/2 * c_m^2 + ...` mismatch the seed-persistence probe characterised.
+        # latent descent step.
         init_residuals = per_layer_residuals(
             net, x, e_diag.m_initial, e_diag.v_initial,
         )
-        # Freeze-time per-layer residuals: same metrics evaluated at the frozen
-        # latent posterior, AGAINST THE PRE-M-STEP `net`. This is the state the
-        # FIRST M-step iteration actually sees, so freeze/K above noise floor
-        # is the precondition for the tau-data gradient to be operational.
+        # Freeze-time per-layer residuals.
         freeze_residuals = per_layer_residuals(
             net, x, frozen.m_zs, frozen.v_zs,
         )
         # M-step: run m_step_iters sequential gradient updates on the SAME
-        # frozen latent posterior. Each iteration recomputes (m_p, v_p) from
-        # the current (mu, tau) so the gradient signal updates as the weights
-        # move. Section 6.7 explicitly permits "one or a few" inner M-step
-        # gradient updates per minibatch. The Python loop is unrolled at jit
-        # trace time so the compiled graph contains m_step_iters m_step calls.
+        # frozen latent posterior.
         new_net = net
         first_m_diag = None
         m_diag = None
@@ -141,29 +109,24 @@ def make_batch_step(cfg, N_train: int):
                 key=keys_mstep[it],
                 mc_samples_train=mc_samples_train,
                 lambda_y=lambda_y,
+                gamma_mu_hidden=gamma_mu_hidden,
+                gamma_mu_output=gamma_mu_output,
             )
             if first_m_diag is None:
                 first_m_diag = m_diag
-        # Compose per-layer first/last diagnostics across the m_step_iters
-        # inner loop. For L_hidden == 1 the hidden diag key is "hidden"
-        # (legacy); for L >= 2 it's "hidden_0", "hidden_1", ... — see
-        # `m_step` in bpcn/training/m_step.py for the naming convention.
+        # Compose per-layer first/last diagnostics across the m_step_iters inner loop.
         m_diag = {
             k: _with_loop_kl_summary(first_m_diag[k], m_diag[k])
             for k in m_diag
         }
 
-        # F_DPC decomposition snapshot AFTER M-step (extension Eq. 72).
-        # `output_weight=lambda_y` makes the returned f_out match the scalar
-        # the M-step descended, so f_out + f_trans_dpc + f_weight_kl reads as
-        # F_cat-DPC. Pass the *tuple* of per-layer latents (frozen.m_zs /
-        # frozen.v_zs) so the multi-layer F_trans_dpc sum visits every hidden
-        # layer. Under L_hidden==1 these are 1-tuples and the result matches
-        # the legacy single-array call exactly.
+        # F_DPC decomposition snapshot AFTER M-step.
         f_dpc_terms = shared_energy_terms(
             new_net, x, y_mean, y_var, frozen.m_zs, frozen.v_zs,
             y_idx=y_idx, key=key_snapshot, mc_samples_train=mc_samples_train,
             gamma_hidden=gamma_hidden, gamma_output=gamma_output,
+            gamma_mu_hidden=gamma_mu_hidden,
+            gamma_mu_output=gamma_mu_output,
             weight_kl_scale=weight_kl_scale,
             output_weight=lambda_y,
         )
