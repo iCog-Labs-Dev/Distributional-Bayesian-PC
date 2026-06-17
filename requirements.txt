@@ -1,4 +1,4 @@
-jax[cuda13]
+jax
 numpy
 pandas
 scikit-learn

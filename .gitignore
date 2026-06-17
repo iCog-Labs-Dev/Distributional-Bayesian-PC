@@ -5,4 +5,10 @@ reports/
 venv/
 .vscode/
 
+docs/
+DBPCN/
+
 __pycache__/
+*.pyc
+*.pyo
+.DS_Store
