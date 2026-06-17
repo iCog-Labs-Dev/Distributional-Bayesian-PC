@@ -51,6 +51,9 @@ from bpcn.configs.base import BaseConfig
 from bpcn.data.mnist import load_split
 from bpcn.evaluation.predict import _eval_one_batch
 from experiments.mnist import _load_checkpoint
+from logger import get_logger
+
+_log = get_logger("ood_eval")
 
 
 @partial(jax.jit, static_argnames=(
@@ -218,13 +221,54 @@ def _rotate_mnist_flat(x_flat: np.ndarray, angle_deg: float) -> np.ndarray:
     return np.clip(out, 0.0, 1.0).reshape(N, 784).astype(np.float32)
 
 
+# Pre-§23-Stage-2 BaseConfig defaults for fields whose defaults were flipped
+# during the 2026-06-17 cleanup. When a saved `config.json` predates that
+# flip, the field is absent from the JSON and `BaseConfig(**filtered)` would
+# silently inherit the new Stage-2 default — e.g. `output_likelihood`
+# becomes `"categorical"` for a Gaussian-pseudo-output legacy run, or
+# `alpha_scheme` becomes `"matched_he"` for a run trained with `α=1.0`. To
+# keep `_load_run` faithful to the original training-time semantics, missing
+# entries are backfilled here with their pre-flip values.
+_LEGACY_STAGE2_DEFAULTS = {
+    "output_likelihood": "gaussian",
+    "output_estimator": "mean",
+    "alpha_scheme": "constant",
+    "init_perturb_std": 0.0,
+    "gamma_hidden": 1.0,
+    "gamma_mu_hidden": None,
+    "gamma_mu_output": None,
+    "eta_mu_hidden": 1e-3,
+    "eta_tau_hidden": 1e-4,
+    "eta_mu_output": 1e-3,
+    "eta_tau_output": 1e-4,
+    "T_z": 8,
+    "m_step_iters": 1,
+}
+
+
 def _load_run(run_dir: str) -> Tuple[BaseConfig, "Network"]:
     """Reconstruct (BaseConfig, Network) from `run_dir`.
 
     Backward-compatible with older `config.json` files that may be missing
-    newer fields (`output_likelihood`, `output_estimator`, `lambda_y`, etc.):
-    fields missing from the JSON are filled by `BaseConfig` defaults via the
-    `**kwargs` constructor path, and unrecognized JSON keys are dropped.
+    newer fields. Two layers of migration run BEFORE `BaseConfig(**filtered)`:
+
+    1. Schema migration. Pre-multi-layer configs saved scalar `hidden_dim`
+       and `psi` fields (removed during the 2026-06-06 cleanup). When those
+       are present and the canonical tuple counterparts (`hidden_dims` /
+       `activations`) are absent, we derive the tuple form. A legacy run
+       saved with `psi=None` (the old identity default) loads as
+       `activations=("identity",)`, not the new `("relu",)`.
+
+    2. Default-flip migration. The §23 Stage-2 cleanup flipped the
+       BaseConfig defaults for `output_likelihood`, `output_estimator`,
+       `alpha_scheme`, η_*, γ_*, T_z, m_step_iters, and `init_perturb_std`
+       to the Stage-2 recipe (see `_LEGACY_STAGE2_DEFAULTS` above). When
+       any of those fields are missing from the legacy JSON, we set them
+       explicitly to their pre-flip values, so a legacy checkpoint is
+       evaluated under the recipe it was actually trained with rather than
+       silently absorbing the new Stage-2 prior scale / output mode.
+
+    Unrecognized JSON keys are dropped by the final `filtered` pass.
     """
     cfg_path = os.path.join(run_dir, "config.json")
     if not os.path.exists(cfg_path):
@@ -234,6 +278,22 @@ def _load_run(run_dir: str) -> Tuple[BaseConfig, "Network"]:
     # `classes` is serialised as a list but BaseConfig expects a tuple.
     if "classes" in raw and isinstance(raw["classes"], list):
         raw["classes"] = tuple(raw["classes"])
+    # Legacy `hidden_dim` (scalar) → `hidden_dims` tuple. Only when the
+    # canonical tuple field is missing (or null).
+    if raw.get("hidden_dims") is None and raw.get("hidden_dim") is not None:
+        raw["hidden_dims"] = (int(raw["hidden_dim"]),)
+    # Legacy `psi` (scalar str) → `activations` tuple of length L_hidden.
+    if raw.get("activations") is None:
+        psi = raw.get("psi") or "identity"
+        L_hidden = len(raw.get("hidden_dims") or (1,))
+        raw["activations"] = (psi,) * L_hidden
+    # Backfill pre-flip defaults for any Stage-2-flipped field that's
+    # missing or null in the legacy JSON. `setdefault` doesn't override
+    # values the config explicitly set (e.g., a categorical-MC legacy run
+    # that did serialise `output_likelihood="categorical"` keeps it).
+    for key, legacy_default in _LEGACY_STAGE2_DEFAULTS.items():
+        if raw.get(key) is None:
+            raw[key] = legacy_default
     known = {f.name for f in dataclasses.fields(BaseConfig)}
     filtered = {k: v for k, v in raw.items() if k in known}
     cfg = BaseConfig(**filtered)
@@ -243,7 +303,7 @@ def _load_run(run_dir: str) -> Tuple[BaseConfig, "Network"]:
 
 def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
                   key: jax.Array, mc_samples: int, batch_size: int,
-                  ece_bins: int) -> Dict[str, float]:
+                  ece_bins: int):
     """Run target-free E-step + MEAN/MC predictives on `(x, y_idx)`; return metrics.
 
     Identical eval geometry to `bpcn.evaluation.predict.evaluate_split`: one
@@ -309,7 +369,7 @@ def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
     ent_mc = -np.sum(p_mc_clip * np.log(p_mc_clip), axis=-1)
     ent_mean = -np.sum(p_mean_clip * np.log(p_mean_clip), axis=-1)
 
-    return {
+    metrics = {
         # MC predictive
         "MC_accuracy": float((pred_mc == y_idx).mean()),
         "MC_nll": float(-log_p_mc.mean()),
@@ -329,6 +389,7 @@ def _eval_dataset(net, cfg: BaseConfig, x: np.ndarray, y_idx: np.ndarray,
         "H_gap_std": float((ent_mc - ent_mean).std()),
         "n": int(N),
     }
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +465,7 @@ def _write_comparison(out_dir: str, runs: List[str], angles: Tuple[float, ...],
         _section("MC ECE",              "MC_ece"),
         _section("MEAN ECE",            "MEAN_ece"),
     ]
+
     with open(os.path.join(out_dir, "comparison.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(parts))
 
@@ -417,19 +479,19 @@ def main(argv=None) -> int:
     runs = list(args.run_dirs)
     angles = tuple(float(a) for a in args.rotations)
 
-    print(f"[ood_eval] runs={runs}")
-    print(f"[ood_eval] angles={list(angles)} deg")
-    print(f"[ood_eval] n_test={args.n_test}, mc_samples={args.mc_samples}, "
-          f"eval_key={args.eval_key}, batch_size={args.batch_size}")
+    _log.info(f"runs={runs}")
+    _log.info(f"angles={list(angles)} deg")
+    _log.info(f"n_test={args.n_test}, mc_samples={args.mc_samples}, "
+              f"eval_key={args.eval_key}, batch_size={args.batch_size}")
 
     results: Dict[str, Dict[float, Dict[str, float]]] = {}
 
     for run in runs:
         run_name = os.path.basename(run.rstrip(os.sep))
-        print(f"\n[ood_eval] === {run_name} ===")
+        _log.info(f"=== {run_name} ===")
         t0 = time.time()
         cfg, net = _load_run(run)
-        print(f"  cfg: classes={cfg.classes}, hidden_dims={cfg.hidden_dims}, "
+        _log.info(f"  cfg: classes={cfg.classes}, hidden_dims={cfg.hidden_dims}, "
               f"activations={cfg.activations}, output_likelihood={cfg.output_likelihood}, "
               f"output_estimator={cfg.output_estimator}")
         test = load_split(
@@ -438,7 +500,7 @@ def main(argv=None) -> int:
         )
         x_id = np.asarray(test.x)
         y_idx = np.asarray(test.y_idx)
-        print(f"  loaded test split: x={x_id.shape}, n={len(y_idx)}")
+        _log.info(f"  loaded test split: x={x_id.shape}, n={len(y_idx)}")
 
         results[run_name] = {}
         for angle in angles:
@@ -452,7 +514,7 @@ def main(argv=None) -> int:
                 ece_bins=int(args.ece_bins),
             )
             results[run_name][angle] = metrics
-            print(
+            _log.info(
                 f"  angle={angle:>5g}°  "
                 f"MC acc={metrics['MC_accuracy']:.4f}  MEAN acc={metrics['MEAN_accuracy']:.4f}  "
                 f"MC NLL={metrics['MC_nll']:.4f}  MC H={metrics['MC_entropy_mean']:.3f}  "
@@ -473,7 +535,7 @@ def main(argv=None) -> int:
         }
         out_path = os.path.join(run, "ood_eval.json")
         _atomic_json_dump(out_path, per_run)
-        print(f"  wrote {out_path}  ({time.time() - t0:.1f}s total for this run)")
+        _log.info(f"  wrote {out_path}  ({time.time() - t0:.1f}s total for this run)")
 
     # Unified comparison report
     _write_comparison(
@@ -481,7 +543,7 @@ def main(argv=None) -> int:
         results, n_test=args.n_test, mc_samples=int(args.mc_samples),
         eval_key=int(args.eval_key),
     )
-    print(f"\n[ood_eval] DONE. Comparison written to {args.out_dir}")
+    _log.info(f"DONE. Comparison written to {args.out_dir}")
     return 0
 
 

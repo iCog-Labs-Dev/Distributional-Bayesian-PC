@@ -1,20 +1,9 @@
-"""Test-time prediction and uncertainty extraction.
+"""
+Test-time prediction and uncertainty extraction.
 
-References (write-up: distributional_predictive_coding_v2.pdf):
-- Section 6.6.
-- Eq. 102: predictive distribution = integral over q(z) q(W).
-- Eq. 103: MC classification predictive (1/S) sum softmax(W_y_s z^L_s).
-- Eq. 104: predictive entropy H[y | x*, D].
-- Eq. 105: epistemic proxy = mutual information.
+For BPCN at test time, we run the target-free E-step on the test input, then MC-sample 
+from q(z^L) and q(W_y) for the categorical predictive distribution.
 
-For BPCN at test time, we run the target-free E-step on the test input
-(Section 6.6 first paragraph), then MC-sample from q(z^L) and q(W_y) for
-the categorical predictive distribution in Eq. 103.
-
-The hot path is `evaluate_split`, which compiles a single jitted graph
-that scans `_eval_one_batch` over fixed-size batches of the test set.
-Padding to a multiple of `batch_size` is masked out before any reduction,
-so the math is identical to evaluating only the valid examples.
 """
 from functools import partial
 from typing import NamedTuple
@@ -22,14 +11,8 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from ..inference.e_step import e_step
-from ..inference.feature_moments import psi_moments, apply_psi_sample
-
-
-# ---------------------------------------------------------------------------
-# JAX-pure building blocks (kept as module-level helpers — reused by
-# `bpcn/scripts/sanity_checks.py` and composed inside `_eval_one_batch`).
-# ---------------------------------------------------------------------------
+from bpcn.inference.e_step import e_step
+from bpcn.inference.feature_moments import psi_moments, apply_psi_sample
 
 
 def _target_free_frozen(
@@ -39,9 +22,10 @@ def _target_free_frozen(
     gamma_hidden: float = 1.0,
     gamma_output: float = 1.0,
 ):
-    """Run the target-free test-time E-step (v2 Section 6.6 paragraph 1).
+    """
+    Run the target-free test-time E-step.
 
-    Descends F_DPC (extension Eq. 12) with `output_weight=0.0` so the latent
+    Descends F_DPC with `output_weight=0.0` so the latent
     is anchored only by the hidden transition. Returns the frozen (m_z, v_z)
     posterior consumed by the MC and MEAN predictive helpers.
     """
@@ -50,6 +34,7 @@ def _target_free_frozen(
     placeholder_target = jnp.zeros((B, C), dtype=x.dtype)
     if y_var is None:
         y_var = jnp.zeros_like(placeholder_target)
+
     frozen, _ = e_step(
         net, x, placeholder_target,
         T_z=T_z, eta_m=eta_m, eta_u=eta_u, v_init=v_init,
@@ -57,12 +42,13 @@ def _target_free_frozen(
         y_var=y_var,
         gamma_hidden=gamma_hidden,
         gamma_output=gamma_output,
+        init_perturb_std=0.0,
     )
     return frozen
 
 
 def _mean_predict_from_frozen(net, frozen):
-    # Presynaptic feature to the output layer is psi_L(m_z) (Section 4.5).
+    """ Predictive probabilities from the frozen posterior mean. """
     m_h, _ = psi_moments(net.activations[-1], frozen.m_z, frozen.v_z)
     return jax.nn.softmax(m_h @ net.layers[-1].mu.T, axis=-1)
 
@@ -73,17 +59,13 @@ def _mc_predict_from_frozen(net, frozen, key, S: int):
     sigma_z = jnp.sqrt(frozen.v_z)
     m_z = frozen.m_z
     # Top-latent activation psi_L is the only one consumed by the output
-    # head (continuation Eq. 26: a^(s) = W^(s) psi_L(z^(L,(s)))).
     psi_top = net.activations[-1]
 
     def one_sample(k):
         k_W, k_z = jax.random.split(k)
         W_sample = output.mu + sigma_y * jax.random.normal(k_W, output.mu.shape)
         z_sample = m_z + sigma_z * jax.random.normal(k_z, m_z.shape)
-        # Apply psi_L to the sample directly (Section 4.5 option 4: MC samples
-        # through psi). This is exact for the sample; the delta-method
-        # approximation used by `psi_moments` is only needed when no samples
-        # are available.
+        # Apply psi_L to the sample
         z_sample = apply_psi_sample(psi_top, z_sample)
         logits = z_sample @ W_sample.T                     # [B, C]
         return jax.nn.softmax(logits, axis=-1)
@@ -99,18 +81,14 @@ def predictive_entropy(p_hat):
     return -jnp.sum(p * jnp.log(p), axis=-1)
 
 
-# ---------------------------------------------------------------------------
-# Jitted batched eval (the hot path).
-# ---------------------------------------------------------------------------
-
-
 @partial(jax.jit, static_argnames=("T_z", "mc_samples"))
 def _eval_one_batch(
     net, x_batch, key, *,
     T_z, eta_m, eta_u, v_init,
     gamma_hidden, gamma_output, mc_samples,
 ):
-    """One fused XLA pass: target-free E-step + MC predict + MEAN predict.
+    """
+    One fused XLA pass: target-free E-step + MC predict + MEAN predict.
 
     Returns
     -------
@@ -217,28 +195,13 @@ def _evaluate_padded_jit(
     )
 
 
-# ---------------------------------------------------------------------------
-# Public entry point.
-# ---------------------------------------------------------------------------
-
-
 def evaluate_split(net, split, cfg, key, *, batch_size=None):
-    """Run MC and posterior-mean predictives on a Split; return metrics dict.
+    """
+    Run MC and posterior-mean predictives on a Split; return metrics dict.
 
     The whole eval (target-free E-step + MC predictive + MEAN predictive +
     metric reductions) runs inside a single jitted graph via `jax.lax.scan`
-    over fixed-size batches. The test set is padded to a multiple of
-    `batch_size` and the pad rows are masked out before reduction, so the
-    math is identical to a loop over only the valid examples — only the
-    wiring differs.
-
-    Parameters
-    ----------
-    batch_size : int or None
-        Eval batch size. `None` (default) uses `cfg.batch_size`, matching
-        the training-time minibatch size set by `--batch-size`. Passing an
-        explicit value overrides this — useful for compile-time signature
-        control during testing.
+    over fixed-size batches.
     """
     if batch_size is None:
         batch_size = int(cfg.batch_size)
@@ -265,12 +228,6 @@ def evaluate_split(net, split, cfg, key, *, batch_size=None):
     else:
         x_padded, y_padded = x_arr, y_arr
     mask = jnp.arange(N_padded) < N
-
-    # Match the legacy key-allocation convention used by the previous Python
-    # loop (`keys[ki]` with `ki` starting at 1): allocate `n_batches + 1`
-    # keys and discard the 0th. This keeps the MC draws bit-identical to
-    # the pre-refactor implementation so eval metrics agree to FP-reduction
-    # noise rather than to MC-sampling noise.
     keys = jax.random.split(key, n_batches + 1)[1:]
 
     scalars = _evaluate_padded_jit(

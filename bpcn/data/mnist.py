@@ -1,4 +1,5 @@
-"""MNIST loader with optional class subset filter.
+"""
+MNIST loader with optional class subset filter.
 
 Uses sklearn.datasets.fetch_openml. Caches to ~/scikit_learn_data on first call.
 """
