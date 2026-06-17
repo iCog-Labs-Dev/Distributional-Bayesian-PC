@@ -1,4 +1,6 @@
 runs/
+reports/
+
 .venv/
 venv/
 .vscode/
