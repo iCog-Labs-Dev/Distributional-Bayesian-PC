@@ -51,6 +51,9 @@ from bpcn.configs.base import BaseConfig
 from bpcn.data.mnist import load_split
 from bpcn.evaluation.predict import _eval_one_batch
 from experiments.mnist import _load_checkpoint
+from logger import get_logger
+
+_log = get_logger("ood_eval")
 
 
 @partial(jax.jit, static_argnames=(
@@ -476,19 +479,19 @@ def main(argv=None) -> int:
     runs = list(args.run_dirs)
     angles = tuple(float(a) for a in args.rotations)
 
-    print(f"[ood_eval] runs={runs}")
-    print(f"[ood_eval] angles={list(angles)} deg")
-    print(f"[ood_eval] n_test={args.n_test}, mc_samples={args.mc_samples}, "
-          f"eval_key={args.eval_key}, batch_size={args.batch_size}")
+    _log.info(f"runs={runs}")
+    _log.info(f"angles={list(angles)} deg")
+    _log.info(f"n_test={args.n_test}, mc_samples={args.mc_samples}, "
+              f"eval_key={args.eval_key}, batch_size={args.batch_size}")
 
     results: Dict[str, Dict[float, Dict[str, float]]] = {}
 
     for run in runs:
         run_name = os.path.basename(run.rstrip(os.sep))
-        print(f"\n[ood_eval] === {run_name} ===")
+        _log.info(f"=== {run_name} ===")
         t0 = time.time()
         cfg, net = _load_run(run)
-        print(f"  cfg: classes={cfg.classes}, hidden_dims={cfg.hidden_dims}, "
+        _log.info(f"  cfg: classes={cfg.classes}, hidden_dims={cfg.hidden_dims}, "
               f"activations={cfg.activations}, output_likelihood={cfg.output_likelihood}, "
               f"output_estimator={cfg.output_estimator}")
         test = load_split(
@@ -497,7 +500,7 @@ def main(argv=None) -> int:
         )
         x_id = np.asarray(test.x)
         y_idx = np.asarray(test.y_idx)
-        print(f"  loaded test split: x={x_id.shape}, n={len(y_idx)}")
+        _log.info(f"  loaded test split: x={x_id.shape}, n={len(y_idx)}")
 
         results[run_name] = {}
         for angle in angles:
@@ -511,7 +514,7 @@ def main(argv=None) -> int:
                 ece_bins=int(args.ece_bins),
             )
             results[run_name][angle] = metrics
-            print(
+            _log.info(
                 f"  angle={angle:>5g}°  "
                 f"MC acc={metrics['MC_accuracy']:.4f}  MEAN acc={metrics['MEAN_accuracy']:.4f}  "
                 f"MC NLL={metrics['MC_nll']:.4f}  MC H={metrics['MC_entropy_mean']:.3f}  "
@@ -532,7 +535,7 @@ def main(argv=None) -> int:
         }
         out_path = os.path.join(run, "ood_eval.json")
         _atomic_json_dump(out_path, per_run)
-        print(f"  wrote {out_path}  ({time.time() - t0:.1f}s total for this run)")
+        _log.info(f"  wrote {out_path}  ({time.time() - t0:.1f}s total for this run)")
 
     # Unified comparison report
     _write_comparison(
@@ -540,7 +543,7 @@ def main(argv=None) -> int:
         results, n_test=args.n_test, mc_samples=int(args.mc_samples),
         eval_key=int(args.eval_key),
     )
-    print(f"\n[ood_eval] DONE. Comparison written to {args.out_dir}")
+    _log.info(f"DONE. Comparison written to {args.out_dir}")
     return 0
 
 

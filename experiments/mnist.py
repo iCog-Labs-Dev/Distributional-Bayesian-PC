@@ -35,6 +35,9 @@ from bpcn.inference.e_step import e_step
 from bpcn.inference.feature_moments import psi_moments
 from bpcn.models.network import init_network
 from bpcn.training.loop import make_batch_step
+from logger import get_logger
+
+_log = get_logger("mnist")
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +362,6 @@ def run(
     n_train_load: int = 60000,
     n_test_load: int = 10000,
     run_eval: bool = True,
-    log_fn=print,
 ) -> dict:
     """Pure-function training driver.
 
@@ -367,17 +369,17 @@ def run(
       - history: JSON-serialisable per-epoch list (matches runs/base/history.json layout).
       - net    : final Network pytree.
     """
-    log_fn(f"[bpcn.mnist] Loading MNIST classes {cfg.classes} ...")
+    _log.info(f"Loading MNIST classes {cfg.classes} ...")
     train = load_split(cfg.classes, train=True, seed=cfg.seed,
                        n_train=n_train_load, n_test=n_test_load)
     test = load_split(cfg.classes, train=False, seed=cfg.seed,
                       n_train=n_train_load, n_test=n_test_load)
     N_train = len(train.x)
     N_test = len(test.x)
-    log_fn(f"[bpcn.mnist]   train={N_train}, test={N_test}")
+    _log.info(f"  train={N_train}, test={N_test}")
     cfg = dataclasses.replace(cfg, n_train_total=N_train, n_test_total=N_test)
 
-    log_fn(f"[bpcn.mnist] Initializing network {cfg.layer_dims} ...")
+    _log.info(f"Initializing network {cfg.layer_dims} ...")
     key = jax.random.PRNGKey(cfg.seed)
     key, init_key = jax.random.split(key)
     net = init_network(
@@ -401,8 +403,8 @@ def run(
         # scheme is loud in the run output.
         per_layer_alpha = [float(lr.alpha) for lr in net.layers]
         per_layer_sigma2 = [float(lr.tau[0, 0]) for lr in net.layers]
-        log_fn(
-            f"[bpcn.mnist]   alpha_scheme={cfg.alpha_scheme!r}: per-layer α "
+        _log.info(
+            f"  alpha_scheme={cfg.alpha_scheme!r}: per-layer α "
             f"= {[round(a, 5) for a in per_layer_alpha]}, "
             f"init τ = {[round(t, 4) for t in per_layer_sigma2]} "
             f"(α_hidden/output and init_log_var fields IGNORED under matched scheme)"
@@ -421,8 +423,8 @@ def run(
         gamma_mu_output=cfg.gamma_mu_output,
         weight_kl_scale=1.0 / float(N_train),
     )[0])
-    log_fn(
-        f"[bpcn.mnist]   F_weight_kl baseline at init = {weight_kl_initial:.4f} nats/batch "
+    _log.info(
+        f"  F_weight_kl baseline at init = {weight_kl_initial:.4f} nats/batch "
         f"(per-data-point scale)"
     )
 
@@ -455,8 +457,8 @@ def run(
             )
             if (bi + 1) % 20 == 0 or bi == n_batches - 1:
                 last = ep_diag.records[-1]
-                log_fn(
-                    f"[bpcn.mnist]   epoch {epoch} batch {bi+1}/{n_batches} "
+                _log.info(
+                    f"  epoch {epoch} batch {bi+1}/{n_batches} "
                     f"F_init={last['F_initial']:.4f} F_final={last['F_final']:.4f} "
                     f"F_DPC={last['F_DPC_total']:.4f} "
                     f"kl_data(out)={last['output/kl_data']:.4f}"
@@ -465,8 +467,8 @@ def run(
         summary = ep_diag.summary()
         elapsed = time.time() - t0
         top_hidden = f"hidden_{cfg.L_hidden - 1}"
-        log_fn(
-            f"[bpcn.mnist] epoch {epoch} done in {elapsed:.1f}s; "
+        _log.info(
+            f"epoch {epoch} done in {elapsed:.1f}s; "
             f"avg F_init={summary['F_initial']:.4f} F_final={summary['F_final']:.4f} "
             f"kl_data({top_hidden})={summary[f'{top_hidden}/kl_data']:.4f} "
             f"kl_data(out)={summary['output/kl_data']:.4f} "
@@ -474,8 +476,8 @@ def run(
             f"freeze/K({top_hidden})={summary.get(f'{top_hidden}/freeze/K', 0.0):.3e}"
         )
         # Decomposed weight-KL diagnostic (continuation note §5 step 2).
-        log_fn(
-            f"[bpcn.mnist] epoch {epoch} F_weight_kl="
+        _log.info(
+            f"epoch {epoch} F_weight_kl="
             f"{summary.get('F_weight_kl', 0.0):.4f}  "
             f"(μ={summary.get('F_weight_kl_mu', 0.0):.4f}  "
             f"var={summary.get('F_weight_kl_var', 0.0):.4f}  "
@@ -508,8 +510,8 @@ def run(
             # the post-psi_L presynaptic moments.
             m_h_vd, v_h_vd = psi_moments(cfg.activations[-1], frozen.m_z, frozen.v_z)
             vd = variance_decomposition(net, m_h_vd, v_h_vd, layer_idx=-1)
-            log_fn(
-                f"[bpcn.mnist] epoch {epoch} eval: "
+            _log.info(
+                f"epoch {epoch} eval: "
                 f"MC[acc={metrics['accuracy']:.4f} "
                 f"NLL={-metrics['log_likelihood_mean']:.4f} "
                 f"H={metrics['entropy_mean']:.4f}]  "
@@ -517,8 +519,8 @@ def run(
                 f"NLL={-metrics['mean_log_likelihood_mean']:.4f} "
                 f"H={metrics['mean_entropy_mean']:.4f}]"
             )
-            log_fn(
-                f"[bpcn.mnist] epoch {epoch} variance decomposition (output layer): "
+            _log.info(
+                f"epoch {epoch} variance decomposition (output layer): "
                 f"residual={vd['residual_frac']:.3f} "
                 f"propagated={vd['propagated_frac']:.3f} "
                 f"epistemic={vd['epistemic_frac']:.3f}"
@@ -634,10 +636,10 @@ def main(argv=None):
     )
     cfg_runtime = result.get("cfg", cfg)
     out = save_artifacts(cfg_runtime, result)
-    print(f"[bpcn.mnist] DONE. Artefacts in {out}")
+    _log.info(f"DONE. Artefacts in {out}")
     return 0
 
 
 if __name__ == "__main__":
-    print(f"Starting Distributional Bayesian Predictive Coding experiment on: {jax.default_backend()}")
+    _log.info(f"Starting Distributional Bayesian Predictive Coding experiment on: {jax.default_backend()}")
     sys.exit(main())
