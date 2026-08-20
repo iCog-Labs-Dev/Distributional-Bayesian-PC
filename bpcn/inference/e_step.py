@@ -1,173 +1,188 @@
-""" Predictive-coding latent E-step (Algorithm 1) descending the shared energy. """
+"""Latent E-step for distributional predictive coding."""
 
-from typing import NamedTuple, Tuple
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 
-from bpcn.models.network import Network
+from bpcn.configs.base import BPCNConfig, InferenceConfig
+from bpcn.data.types import Targets
+from bpcn.inference.shared_energy import latent_free_energy
+from bpcn.inference.state import LatentState
+from bpcn.models.activations import activation_moments
 from bpcn.models.moments import moment_forward
-from bpcn.inference.shared_energy import shared_free_energy
-from bpcn.inference.feature_moments import psi_moments
-from bpcn.utils.safe_math import clamp_u
-
- 
-class FrozenLatents(NamedTuple):
-    """ Output of the E-step: stop-gradient-ed (mean, variance) per hidden layer. """
-    m_zs: Tuple[jax.Array, ...]    # length L_hidden, each [B, d_l]
-    v_zs: Tuple[jax.Array, ...]    # length L_hidden, each [B, d_l]
-
-    @property
-    def m_z(self) -> jax.Array:
-        return self.m_zs[-1]
-
-    @property
-    def v_z(self) -> jax.Array:
-        return self.v_zs[-1]
+from bpcn.models.network import Network
+from bpcn.utils.safe_math import clamp_latent_log_variance
 
 
-class EStepDiagnostics(NamedTuple):
-    F_trace: jax.Array          # [T_z]   per-iteration objective value (mean over batch)
-    F_initial: jax.Array        # scalar  objective at t=0
-    F_final: jax.Array          # scalar  objective after T_z steps
-    m_initial: object = None     # Tuple[jax.Array, ...] length L_hidden
-    v_initial: object = None     # Tuple[jax.Array, ...] length L_hidden
+class EStepMetrics(NamedTuple):
+    initial_energy: jax.Array
+    final_energy: jax.Array
+    energy_trace: jax.Array
 
 
-def initial_latents(net: Network, x, v_init: float, *,
-                    perturb_std: float = 0.0, perturb_key=None):
-    """ Initialize q(z^1), ..., q(z^L) by predictive feedforward. """
-    
-    L_hidden = net.L_hidden
-    v_floor = jnp.asarray(v_init, dtype=x.dtype)
-    m_h, v_h = x, jnp.zeros_like(x)
-    m_list = []
-    u_list = []
-    if perturb_std > 0.0 and perturb_key is None:
-        raise ValueError(
-            "initial_latents: `perturb_key` is required when `perturb_std > 0`."
+class EStepResult(NamedTuple):
+    latents: LatentState
+    metrics: EStepMetrics
+
+
+def _initialize_latents(
+    network: Network,
+    inputs,
+    config: InferenceConfig,
+    perturbation_key,
+):
+    variance_floor = jnp.asarray(config.initial_variance, dtype=inputs.dtype)
+    feature_mean, feature_variance = inputs, jnp.zeros_like(inputs)
+    means = []
+    log_variances = []
+    for layer_index in range(network.hidden_layer_count):
+        predictive = moment_forward(
+            network.layers[layer_index], feature_mean, feature_variance
         )
-    for l in range(L_hidden):
-        m_pred, v_pred = moment_forward(net.layers[l], m_h, v_h)
-        if perturb_std > 0.0:
-            key_l = jax.random.fold_in(perturb_key, l)
-            sigma_l = jnp.sqrt(jnp.maximum(v_pred, v_floor))
-            noise = jax.random.normal(key_l, m_pred.shape, dtype=m_pred.dtype)
-            m_pred = m_pred + jnp.asarray(perturb_std, dtype=m_pred.dtype) * sigma_l * noise
-        u_pred = jnp.log(jnp.maximum(v_pred, v_floor))
-        m_list.append(m_pred)
-        u_list.append(u_pred)
-        # Use the current layer's initialized mean as the next source; with
-        # perturb_std > 0 this propagates the seed through the stack.
-        if l + 1 < L_hidden:
-            m_h, v_h = psi_moments(net.activations[l], m_pred, v_pred)
-    return tuple(m_list), tuple(u_list)
+        mean = predictive.mean
+        if config.initial_mean_perturbation_std > 0.0:
+            layer_key = jax.random.fold_in(perturbation_key, layer_index)
+            noise = jax.random.normal(layer_key, mean.shape, dtype=mean.dtype)
+            mean = mean + (
+                config.initial_mean_perturbation_std
+                * jnp.sqrt(jnp.maximum(predictive.variance, variance_floor))
+                * noise
+            )
+        log_variance = jnp.log(
+            jnp.maximum(predictive.variance, variance_floor)
+        )
+        means.append(mean)
+        log_variances.append(log_variance)
+        if layer_index + 1 < network.hidden_layer_count:
+            feature_mean, feature_variance = activation_moments(
+                network.hidden_activations[layer_index],
+                mean,
+                predictive.variance,
+            )
+    return tuple(means), tuple(log_variances)
 
 
-def e_step(
-    net: Network,
-    x: jax.Array,
-    y: jax.Array,
+def _run_e_step(
+    network: Network,
+    inputs,
+    targets: Targets | None,
+    config: InferenceConfig,
     *,
-    T_z: int,
-    eta_m: float,
-    eta_u: float,
-    v_init: float,
-    output_weight: float = 1.0,
-    y_var=None,
-    gamma_hidden: float = 1.0,
-    gamma_output: float = 1.0,
-    y_idx=None,
-    key=None,
-    mc_samples_train: int = 1,
-    # Optional predictive-disequilibrium seed.
-    init_perturb_std: float = 0.0,
-    init_perturb_key=None,
-) -> Tuple[FrozenLatents, EStepDiagnostics]:
-    """
-    Run T_z latent gradient steps then freeze.
-
-    Descends the shared free energy F_DPC with the weight
-    pytree under `jax.lax.stop_gradient`. Assumption I4: no weight gradient
-    flows out of this function.
-
-    """
-    W = jax.lax.stop_gradient(net)
-    # Keep perturbation and E-step MC randomness independent.
-    if init_perturb_std > 0.0 and init_perturb_key is None:
-        if key is None:
-            init_perturb_key = jax.random.PRNGKey(0)
-        else:
-            init_perturb_key, key = jax.random.split(key)
-    m0, u0 = initial_latents(
-        W, x, v_init,
-        perturb_std=init_perturb_std,
-        perturb_key=init_perturb_key,
-    )
-
-    if y_var is None:
-        y_var = jnp.zeros_like(y)
-    # Categorical-mode label safety: the y_idx=None fallback below substitutes
-    # a dummy "class 0 for every example" tensor.
-    if (
-        net.output_likelihood == "categorical"
-        and y_idx is None
-        and float(output_weight) != 0.0
-    ):
-        raise ValueError(
-            "e_step requires `y_idx` when net.output_likelihood == 'categorical' "
-            "and output_weight != 0. Pass the integer class targets explicitly, "
-            "or set output_weight=0.0 for target-free inference (Section 6.6)."
-        )
-    # Placeholder y_idx for Gaussian mode (the F call is shape-stable) and for
-    # categorical target-free inference (the dummy is multiplied by 0).
-    if y_idx is None:
-        B = y.shape[0]
-        y_idx = jnp.zeros((B,), dtype=jnp.int32)
-
+    key,
+    output_loss_weight: float,
+    mc_samples: int,
+) -> EStepResult:
+    frozen_network = jax.lax.stop_gradient(network)
     if key is None:
         key = jax.random.PRNGKey(0)
 
-    def F_of_log_var(m, u, k):
-        # m, u are tuples of length L_hidden; jax.tree.map applies exp per layer.
-        v = jax.tree.map(jnp.exp, u)
-        return shared_free_energy(
-            W, x, y, y_var, m, v,
-            y_idx=y_idx, key=k, mc_samples_train=mc_samples_train,
-            gamma_hidden=gamma_hidden,
-            gamma_output=gamma_output,
-            include_weight_kl=False,
-            output_weight=output_weight,
+    if config.initial_mean_perturbation_std > 0.0:
+        perturbation_key, key = jax.random.split(key)
+    else:
+        perturbation_key = key
+    initial_means, initial_log_variances = _initialize_latents(
+        frozen_network, inputs, config, perturbation_key
+    )
+
+    def objective(means, log_variances, step_key):
+        state = LatentState(
+            means=means,
+            variances=jax.tree.map(jnp.exp, log_variances),
+        )
+        return latent_free_energy(
+            frozen_network,
+            inputs,
+            state,
+            targets=targets,
+            key=step_key,
+            mc_samples=mc_samples,
+            output_loss_weight=output_loss_weight,
         )
 
-    grad_fn = jax.grad(F_of_log_var, argnums=(0, 1))
+    gradient = jax.grad(objective, argnums=(0, 1))
 
-    def step(carry, k):
-        m, u = carry
-        gm, gu = grad_fn(m, u, k)
-        # Per-layer descent step on the tuple of latents (extension Eq. 57).
-        m_new = jax.tree.map(lambda mi, gmi: mi - eta_m * gmi, m, gm)
-        u_new = jax.tree.map(lambda ui, gui: clamp_u(ui - eta_u * gui), u, gu)
-        F_new = F_of_log_var(m_new, u_new, k)
-        return (m_new, u_new), F_new
+    def step(carry, step_key):
+        means, log_variances = carry
+        mean_gradients, variance_gradients = gradient(
+            means, log_variances, step_key
+        )
+        updated_means = jax.tree.map(
+            lambda value, grad: value - config.mean_learning_rate * grad,
+            means,
+            mean_gradients,
+        )
+        updated_log_variances = jax.tree.map(
+            lambda value, grad: clamp_latent_log_variance(
+                value - config.log_variance_learning_rate * grad
+            ),
+            log_variances,
+            variance_gradients,
+        )
+        energy = objective(updated_means, updated_log_variances, step_key)
+        return (updated_means, updated_log_variances), energy
 
-    # Fresh key per inner-loop iteration so MC samples are independent
-    # across the T_z steps. Under Gaussian / MEAN the keys are unused but
-    # threading them keeps the compiled graph constant.
-    keys_scan = jax.random.split(key, T_z)
-    (m_final, u_final), F_trace = jax.lax.scan(step, (m0, u0), keys_scan, length=T_z)
-    F_initial = F_of_log_var(m0, u0, keys_scan[0])
-
-    m_zs = tuple(jax.lax.stop_gradient(m) for m in m_final)
-    v_zs = tuple(jax.lax.stop_gradient(jnp.exp(u)) for u in u_final)
-
-    m_initial_sg = tuple(jax.lax.stop_gradient(m) for m in m0)
-    v_initial_sg = tuple(jax.lax.stop_gradient(jnp.exp(u)) for u in u0)
-
-    diagnostics = EStepDiagnostics(
-        F_trace=F_trace,
-        F_initial=F_initial,
-        F_final=F_trace[-1],
-        m_initial=m_initial_sg,
-        v_initial=v_initial_sg,
+    step_keys = jax.random.split(key, config.steps)
+    (final_means, final_log_variances), energy_trace = jax.lax.scan(
+        step,
+        (initial_means, initial_log_variances),
+        step_keys,
+        length=config.steps,
     )
-    return FrozenLatents(m_zs=m_zs, v_zs=v_zs), diagnostics
+    initial_energy = objective(
+        initial_means, initial_log_variances, step_keys[0]
+    )
+    latents = LatentState(
+        means=tuple(jax.lax.stop_gradient(value) for value in final_means),
+        variances=tuple(
+            jax.lax.stop_gradient(jnp.exp(value))
+            for value in final_log_variances
+        ),
+    )
+    return EStepResult(
+        latents=latents,
+        metrics=EStepMetrics(
+            initial_energy=initial_energy,
+            final_energy=energy_trace[-1],
+            energy_trace=energy_trace,
+        ),
+    )
+
+
+def infer_latents(
+    network: Network,
+    inputs,
+    targets: Targets,
+    config: BPCNConfig,
+    key,
+) -> EStepResult:
+    """Infer supervised latent moments while holding network weights fixed."""
+    if network.output_likelihood == "categorical" and targets.class_indices is None:
+        raise ValueError("categorical inference requires class indices")
+    return _run_e_step(
+        network,
+        inputs,
+        targets,
+        config.inference,
+        key=key,
+        output_loss_weight=config.update.output_loss_weight,
+        mc_samples=config.update.training_mc_samples,
+    )
+
+
+def infer_target_free(
+    network: Network,
+    inputs,
+    config: InferenceConfig,
+    key=None,
+) -> EStepResult:
+    """Infer latent moments using hidden transition energy only."""
+    return _run_e_step(
+        network,
+        inputs,
+        None,
+        config,
+        key=key,
+        output_loss_weight=0.0,
+        mc_samples=1,
+    )
