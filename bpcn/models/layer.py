@@ -1,48 +1,59 @@
-"""BPCN linear-in-weights Gaussian layer."""
+"""Bayesian linear layer used by BPCN."""
 
 from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 
-from bpcn.utils.safe_math import TAU_MIN, TAU_MAX
+from bpcn.utils.safe_math import clamp_weight_log_variance
 
 
 class Layer(NamedTuple):
-    """ Bayesian linear layer with diagonal Gaussian weight posterior. """
-    mu: jax.Array
-    tau: jax.Array
-    beta_inv: jax.Array
-    alpha: float
+    """Linear layer with a diagonal-Gaussian weight posterior."""
+
+    mean: jax.Array
+    log_variance: jax.Array
+    residual_variance: jax.Array
+    prior_std: float
 
     @property
-    def d_out(self) -> int:
-        return int(self.mu.shape[0])
+    def output_dim(self) -> int:
+        return int(self.mean.shape[0])
 
-    def sigma2(self) -> jax.Array:
-        """Weight posterior variance sigma^2 = exp(tau) (Eq. 111)."""
-        return jnp.exp(self.tau)
+    @property
+    def input_dim(self) -> int:
+        return int(self.mean.shape[1])
+
+    def weight_variance(self) -> jax.Array:
+        return jnp.exp(self.log_variance)
 
 
-def init_layer(
+def initialize_layer(
     key: jax.Array,
-    d_out: int,
-    p_in: int,
+    output_dim: int,
+    input_dim: int,
     *,
-    alpha: float = 1.0,
-    beta_inv: float = 1e-2,
-    init_kind: str = "xavier",
-    init_log_var: float = -6.0,
+    prior_std: float,
+    residual_variance: float,
+    initializer: str,
+    initial_log_variance: float,
 ) -> Layer:
-    """Initialize a layer."""
-    if init_kind == "xavier":
-        kappa = jnp.sqrt(1.0 / p_in)
-    elif init_kind == "he":
-        kappa = jnp.sqrt(2.0 / p_in)
+    """Initialize one Bayesian linear layer."""
+    if initializer == "xavier":
+        scale = jnp.sqrt(1.0 / input_dim)
+    elif initializer == "he":
+        scale = jnp.sqrt(2.0 / input_dim)
     else:
-        raise ValueError(f"unknown init_kind: {init_kind!r}")
+        raise ValueError(f"unsupported initializer: {initializer!r}")
 
-    mu = jax.random.normal(key, (d_out, p_in)) * kappa             # Eq. 98
-    tau = jnp.full((d_out, p_in), float(init_log_var))             # Eq. 99
-    tau = jnp.clip(tau, TAU_MIN, TAU_MAX)
-    beta_inv_arr = jnp.full((d_out,), float(beta_inv))
-    return Layer(mu=mu, tau=tau, beta_inv=beta_inv_arr, alpha=float(alpha))
+    mean = jax.random.normal(key, (output_dim, input_dim)) * scale
+    log_variance = clamp_weight_log_variance(
+        jnp.full((output_dim, input_dim), float(initial_log_variance))
+    )
+    residual = jnp.full((output_dim,), float(residual_variance))
+    return Layer(
+        mean=mean,
+        log_variance=log_variance,
+        residual_variance=residual,
+        prior_std=float(prior_std),
+    )
