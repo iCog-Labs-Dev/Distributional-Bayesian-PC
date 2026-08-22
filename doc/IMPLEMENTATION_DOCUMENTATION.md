@@ -619,7 +619,10 @@ is also the default mean KL scale unless `mean_kl_scale` is explicitly given.
 
 `apply_layer_update` adds the configured learning-rate-scaled analytical
 direction to the mean and log variance, then clamps log variance. Residual
-variance and prior standard deviation are copied unchanged.
+variance and prior standard deviation are copied unchanged. Its pre-update
+loss reuses the predictive moments already returned by
+`compute_layer_gradients`; only the updated layer requires another
+`moment_forward` call.
 
 ### Layer update metrics
 
@@ -713,6 +716,13 @@ weight uncertainty influences the inferred latent moments through predictive
 moment propagation; hidden weight matrices are not separately sampled inside
 the final MC probability function. Fixed output residual variance is also not
 sampled when classification probabilities are formed.
+
+For each evaluation batch, the caller's key remains the MC sampling key. A
+role-specific latent-inference key is derived with `jax.random.fold_in(key, 0)`
+and passed to `infer_target_free`. This preserves the established MC stream
+while making an explicitly configured nonzero evaluation perturbation
+reproducible from the caller's key. The default zero-perturbation evaluation
+path is unchanged.
 
 ### Complete-split processing
 

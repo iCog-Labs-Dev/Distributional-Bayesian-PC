@@ -76,7 +76,11 @@ def _predict_batch(
     inference: InferenceConfig,
     mc_samples: int,
 ):
-    latents = infer_target_free(network, inputs, inference).latents
+    # Separate inference randomness without changing the established MC stream.
+    inference_key = jax.random.fold_in(key, 0)
+    latents = infer_target_free(
+        network, inputs, inference, key=inference_key
+    ).latents
     return (
         _mc_probabilities(network, latents, key, mc_samples),
         _mean_probabilities(network, latents),

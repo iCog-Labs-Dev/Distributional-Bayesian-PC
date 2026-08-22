@@ -134,8 +134,7 @@ def _mean_norm(value):
     return jnp.sqrt(jnp.sum(value**2))
 
 
-def _data_loss(layer, input_mean, input_variance, target_mean, target_variance):
-    predictive = moment_forward(layer, input_mean, input_variance)
+def _predictive_data_loss(predictive, target_mean, target_variance):
     terms = gaussian_kl(
         target_mean,
         target_variance,
@@ -143,6 +142,11 @@ def _data_loss(layer, input_mean, input_variance, target_mean, target_variance):
         predictive.variance,
     )
     return terms.value.mean(), terms.variance_residual
+
+
+def _data_loss(layer, input_mean, input_variance, target_mean, target_variance):
+    predictive = moment_forward(layer, input_mean, input_variance)
+    return _predictive_data_loss(predictive, target_mean, target_variance)
 
 
 def apply_layer_update(
@@ -157,8 +161,8 @@ def apply_layer_update(
     log_variance_learning_rate: float,
 ) -> LayerUpdateResult:
     """Apply one ascent step and report concise numerical-health metrics."""
-    loss_before, _ = _data_loss(
-        layer, input_mean, input_variance, target_mean, target_variance
+    loss_before, _ = _predictive_data_loss(
+        gradients.predictive, target_mean, target_variance
     )
     updated_mean = layer.mean + mean_learning_rate * gradients.mean_gradient
     updated_log_variance = clamp_weight_log_variance(
