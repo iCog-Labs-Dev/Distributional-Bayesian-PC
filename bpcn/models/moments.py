@@ -1,38 +1,45 @@
-"""Layerwise predictive moments for BPCN."""
+"""Predictive moments for Bayesian linear layers."""
 
-from typing import Tuple
+from typing import NamedTuple
+
 import jax
 
 from bpcn.models.layer import Layer
 
 
-def moment_forward(
-    layer: Layer,
-    m_h: jax.Array,
-    v_h: jax.Array,
-) -> Tuple[jax.Array, jax.Array]:
-    """Predictive (mean, variance) for one BPCN layer."""
-    sigma2 = layer.sigma2()                                # [d_out, p_in]
-    m_pred = m_h @ layer.mu.T                              # [B, d_out]  (Eq. 60)
-    # v_pred = beta_inv + sum_j [ mu_ij^2 * v_h,j + sigma_ij^2 * (m_h,j^2 + v_h,j) ]
-    propagated = v_h @ (layer.mu ** 2).T                   # mu^2 * v_h  -> [B, d_out]
-    epistemic  = (m_h ** 2 + v_h) @ sigma2.T               # sigma^2 * (m^2+v)
-    v_pred = layer.beta_inv[None, :] + propagated + epistemic  # [B, d_out]   (Eq. 61)
-    return m_pred, v_pred
+class PredictiveMoments(NamedTuple):
+    mean: jax.Array
+    variance: jax.Array
+
+
+class VarianceComponents(NamedTuple):
+    residual: jax.Array
+    propagated: jax.Array
+    epistemic: jax.Array
 
 
 def variance_components(
-    layer: Layer,
-    m_h: jax.Array,
-    v_h: jax.Array,
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
-    """Decompose v_pred into the three terms.
-    residual : [d_out]                broadcast over batch; this is beta_inv only.
-    propagated : [B, d_out]           sum_j mu_ij^2 * v_h,j
-    epistemic : [B, d_out]            sum_j sigma_ij^2 * (m_h,j^2 + v_h,j)
-    """
-    sigma2 = layer.sigma2()
-    propagated = v_h @ (layer.mu ** 2).T
-    epistemic  = (m_h ** 2 + v_h) @ sigma2.T
-    residual   = layer.beta_inv                            # [d_out]
-    return residual, propagated, epistemic
+    layer: Layer, input_mean: jax.Array, input_variance: jax.Array
+) -> VarianceComponents:
+    weight_variance = layer.weight_variance()
+    propagated = input_variance @ (layer.mean**2).T
+    epistemic = (input_mean**2 + input_variance) @ weight_variance.T
+    return VarianceComponents(
+        residual=layer.residual_variance,
+        propagated=propagated,
+        epistemic=epistemic,
+    )
+
+
+def moment_forward(
+    layer: Layer, input_mean: jax.Array, input_variance: jax.Array
+) -> PredictiveMoments:
+    """Return the predictive mean and variance for one layer."""
+    components = variance_components(layer, input_mean, input_variance)
+    predictive_mean = input_mean @ layer.mean.T
+    predictive_variance = (
+        components.residual[None, :]
+        + components.propagated
+        + components.epistemic
+    )
+    return PredictiveMoments(predictive_mean, predictive_variance)

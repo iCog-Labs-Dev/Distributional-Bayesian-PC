@@ -1,252 +1,195 @@
-"""Shared distributional predictive-coding free energy."""
+"""Decomposed free energy shared by BPCN inference and training."""
 
 from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 
-from bpcn.models.network import Network
-from bpcn.models.moments import moment_forward
+from bpcn.configs.base import UpdateConfig
+from bpcn.data.types import Targets
+from bpcn.inference.state import LatentState
+from bpcn.losses.categorical import categorical_output_loss
 from bpcn.losses.distributional_kl import gaussian_kl
-from bpcn.losses.weight_kl import gaussian_weight_kl, gaussian_weight_kl_components
-from bpcn.inference.feature_moments import psi_moments
-from bpcn.inference.categorical_output import categorical_output_loss
+from bpcn.losses.weight_kl import gaussian_weight_kl_components
+from bpcn.models.activations import activation_moments
+from bpcn.models.moments import PredictiveMoments, moment_forward
+from bpcn.models.network import Network
 
 
-class SharedEnergyTerms(NamedTuple):
-    """Decomposed shared-energy components."""
-    f_out: jax.Array         # scalar, per-batch mean of output local KL
-    f_trans_dpc: jax.Array   # scalar, per-batch mean of hidden transition local KL
-    f_weight_kl: jax.Array   # scalar, Sum_l gamma_l KL(q(W_l) || p(W_l)); NO batch averaging
-    f_weight_kl_mu: jax.Array  # scalar, mu-term component of f_weight_kl
-    f_weight_kl_var: jax.Array  # scalar, var-term (log-ratio) component of f_weight_kl
+class EnergyTerms(NamedTuple):
+    output: jax.Array
+    transitions: jax.Array
+    weight_mean_kl: jax.Array
+    weight_variance_kl: jax.Array
+
+    @property
+    def weight_kl(self):
+        return self.weight_mean_kl + self.weight_variance_kl
+
+    @property
+    def total(self):
+        return self.output + self.transitions + self.weight_kl
 
 
-def _layer_presynaptic_moments(net: Network, x, m_zs, v_zs, l: int):
-    """Presynaptic feature moments"""
-    if l == 0:
-        return x, jnp.zeros_like(x)
-    return psi_moments(net.activations[l - 1], m_zs[l - 1], v_zs[l - 1])
-
-
-def _hidden_layer_predictive(net: Network, x, m_zs, v_zs, l: int):
-    """Predictive moments of hidden transition l
-    For l == 0: predicts z^1 from x (input is deterministic).
-    For l >= 1: predicts z^{l+1} from psi_l(z^l).
-    """
-    m_h, v_h = _layer_presynaptic_moments(net, x, m_zs, v_zs, l)
-    return moment_forward(net.layers[l], m_h, v_h)
-
-
-def _output_predictive(net: Network, m_l, v_l):
-    """Predictive moments of the output transition (top latent only)."""
-    output = net.layers[-1]
-    m_h, v_h = psi_moments(net.activations[-1], m_l, v_l)
-    return moment_forward(output, m_h, v_h)
-
-
-def _weight_kl_total(
-    net: Network,
-    gamma_hidden: float,
-    gamma_output: float,
-    *,
-    weight_kl_scale: float = 1.0,
-    gamma_mu_hidden=None,
-    gamma_mu_output=None,
+def presynaptic_moments(
+    network: Network, inputs, latents: LatentState, layer_index: int
 ):
-    """
-    Sum_l gamma_l KL(q_phi_l(W_l) || p(W_l)) over all layers l, 
-    weighted by the given gamma coefficients.
-    """
-    L_hidden = net.L_hidden
-    gmu_h = gamma_hidden if gamma_mu_hidden is None else gamma_mu_hidden
-    gmu_o = gamma_output if gamma_mu_output is None else gamma_mu_output
-    dtype = net.layers[0].mu.dtype
-    total = jnp.zeros((), dtype=dtype)
-    for l in range(L_hidden):
-        layer = net.layers[l]
-        mu_term, var_term = gaussian_weight_kl_components(layer.mu, layer.tau, layer.alpha)
-        total = total + gmu_h * mu_term.sum() + gamma_hidden * var_term.sum()
-    output = net.layers[-1]
-    mu_term_o, var_term_o = gaussian_weight_kl_components(output.mu, output.tau, output.alpha)
-    total = total + gmu_o * mu_term_o.sum() + gamma_output * var_term_o.sum()
-    return weight_kl_scale * total
-
-
-def _weight_kl_total_decomposed(
-    net: Network,
-    gamma_hidden: float,
-    gamma_output: float,
-    *,
-    weight_kl_scale: float = 1.0,
-    gamma_mu_hidden=None,
-    gamma_mu_output=None,
-):
-    """Decomposed Sum_l γ_l KL(q(W_l) || p(W_l)) — mirrors `_weight_kl_total`
-    but returns `(total, mu_total, var_total)`."""
-    L_hidden = net.L_hidden
-    gmu_h = gamma_hidden if gamma_mu_hidden is None else gamma_mu_hidden
-    gmu_o = gamma_output if gamma_mu_output is None else gamma_mu_output
-    dtype = net.layers[0].mu.dtype
-    mu_total = jnp.zeros((), dtype=dtype)
-    var_total = jnp.zeros((), dtype=dtype)
-    for l in range(L_hidden):
-        layer = net.layers[l]
-        mu_term, var_term = gaussian_weight_kl_components(
-            layer.mu, layer.tau, layer.alpha
-        )
-        mu_total = mu_total + gmu_h * mu_term.sum()
-        var_total = var_total + gamma_hidden * var_term.sum()
-    output = net.layers[-1]
-    mu_term_o, var_term_o = gaussian_weight_kl_components(
-        output.mu, output.tau, output.alpha
+    if layer_index == 0:
+        return inputs, jnp.zeros_like(inputs)
+    return activation_moments(
+        network.hidden_activations[layer_index - 1],
+        latents.means[layer_index - 1],
+        latents.variances[layer_index - 1],
     )
-    mu_total = mu_total + gmu_o * mu_term_o.sum()
-    var_total = var_total + gamma_output * var_term_o.sum()
-    mu_total = weight_kl_scale * mu_total
-    var_total = weight_kl_scale * var_total
-    return mu_total + var_total, mu_total, var_total
 
 
-def _output_term(net, y_mean, y_var, y_idx, m_l, v_l, key, mc_samples_train):
-    """
-    Compute F_out for the active output-likelihood mode.
-    Returns a scalar batch-mean F_out in per-data-point scale.
-    """
-    if net.output_likelihood == "gaussian":
-        m_py, v_py = _output_predictive(net, m_l, v_l)
-        return gaussian_kl(m_z=y_mean, v_z=y_var, m_p=m_py, v_p=v_py).kl.sum(axis=-1).mean()
-    elif net.output_likelihood == "categorical":
-        return categorical_output_loss(net, m_l, v_l, y_idx, key, mc_samples_train)
-    else:
-        raise ValueError(
-            f"unknown output_likelihood: {net.output_likelihood!r}; "
-            f"choices: 'gaussian', 'categorical'"
+def hidden_predictive_moments(
+    network: Network, inputs, latents: LatentState, layer_index: int
+) -> PredictiveMoments:
+    input_mean, input_variance = presynaptic_moments(
+        network, inputs, latents, layer_index
+    )
+    return moment_forward(
+        network.layers[layer_index], input_mean, input_variance
+    )
+
+
+def output_predictive_moments(
+    network: Network, latents: LatentState
+) -> PredictiveMoments:
+    feature_mean, feature_variance = activation_moments(
+        network.hidden_activations[-1],
+        latents.top_mean,
+        latents.top_variance,
+    )
+    return moment_forward(network.output_layer, feature_mean, feature_variance)
+
+
+def hidden_transition_energy(network: Network, inputs, latents: LatentState):
+    total = jnp.zeros((), dtype=latents.means[0].dtype)
+    for layer_index in range(network.hidden_layer_count):
+        predictive = hidden_predictive_moments(
+            network, inputs, latents, layer_index
         )
-
-
-def per_layer_residuals(net: Network, x, m_zs, v_zs):
-    """Per-hidden-layer distributional residual diagnostics.
-
-    For each `l in 0..net.L_hidden - 1`, computes the local Gaussian
-    inclusion-KL terms used by the M-step gradient (v2 Eqs. 65/66/68;
-    extension Eqs. 15/16/19) at the given (m_zs, v_zs) state, with weights
-    held fixed.
-
-    Intended to be called twice per minibatch in the training loop:
-      - at init time with `(e_diag.m_initial, e_diag.v_initial)` to log
-        `hidden_l/init/{K,e_abs,r_abs,r_pos_frac,r_pos_mag,r_neg_mag}`,
-      - at freeze time with `(frozen.m_zs, frozen.v_zs)` -- against the
-        pre-M-step `net` -- to log the same metrics under `hidden_l/freeze/...`.
-    Also reused by `experiments/ood_eval.py` to log per-angle wrong-subset
-    residuals at the target-free fixed point.
-    """
-    out = {}
-    for l in range(net.L_hidden):
-        m_p, v_p = _hidden_layer_predictive(net, x, m_zs, v_zs, l)
-        kl = gaussian_kl(m_z=m_zs[l], v_z=v_zs[l], m_p=m_p, v_p=v_p)
-        r = kl.r
-        r_pos = jnp.where(r > 0, r, 0)
-        r_neg = jnp.where(r < 0, -r, 0)
-        out[l] = {
-            "K": kl.kl.mean(),
-            "e_abs": jnp.abs(kl.e).mean(),
-            "r_abs": jnp.abs(r).mean(),
-            "r_pos_frac": (r > 0).mean().astype(kl.kl.dtype),
-            "r_pos_mag": r_pos.mean(),
-            "r_neg_mag": r_neg.mean(),
-        }
-    return out
-
-
-def _trans_dpc_sum(net: Network, x, m_zs, v_zs) -> jax.Array:
-    """Sum over l = 0..L_hidden-1 of the local Gaussian inclusion KLs for the hidden transitions."""
-    total = jnp.zeros((), dtype=m_zs[0].dtype)
-    for l in range(net.L_hidden):
-        m_p, v_p = _hidden_layer_predictive(net, x, m_zs, v_zs, l)
-        total = total + gaussian_kl(
-            m_z=m_zs[l], v_z=v_zs[l], m_p=m_p, v_p=v_p,
-        ).kl.sum(axis=-1).mean()
+        terms = gaussian_kl(
+            latents.means[layer_index],
+            latents.variances[layer_index],
+            predictive.mean,
+            predictive.variance,
+        )
+        total = total + terms.value.sum(axis=-1).mean()
     return total
 
 
-def shared_energy_terms(
-    net: Network,
-    x: jax.Array,
-    y_mean: jax.Array,
-    y_var: jax.Array,
-    m_zs,
-    v_zs,
-    *,
-    y_idx=None,
-    key=None,
-    mc_samples_train: int = 1,
-    gamma_hidden: float = 1.0,
-    gamma_output: float = 1.0,
-    gamma_mu_hidden=None,
-    gamma_mu_output=None,
-    weight_kl_scale: float = 1.0,
-    output_weight: float = 1.0,
-) -> SharedEnergyTerms:
-    """Return the three decomposed terms of F_DPC"""
-    f_trans_dpc = _trans_dpc_sum(net, x, m_zs, v_zs)
-    # Output term consumes the top latent only (continuation Eq. 38).
-    f_out_raw = _output_term(net, y_mean, y_var, y_idx, m_zs[-1], v_zs[-1], key, mc_samples_train)
-    output_weight_arr = jnp.asarray(output_weight, dtype=f_out_raw.dtype)
-    f_out = output_weight_arr * f_out_raw
-    f_weight_kl, f_weight_kl_mu, f_weight_kl_var = _weight_kl_total_decomposed(
-        net, gamma_hidden, gamma_output,
-        weight_kl_scale=weight_kl_scale,
-        gamma_mu_hidden=gamma_mu_hidden,
-        gamma_mu_output=gamma_mu_output,
-    )
-    return SharedEnergyTerms(
-        f_out=f_out,
-        f_trans_dpc=f_trans_dpc,
-        f_weight_kl=f_weight_kl,
-        f_weight_kl_mu=f_weight_kl_mu,
-        f_weight_kl_var=f_weight_kl_var,
-    )
-
-
-def shared_free_energy(
-    net: Network,
-    x: jax.Array,
-    y_mean: jax.Array,
-    y_var: jax.Array,
-    m_zs,
-    v_zs,
-    *,
-    y_idx=None,
-    key=None,
-    mc_samples_train: int = 1,
-    gamma_hidden: float = 1.0,
-    gamma_output: float = 1.0,
-    gamma_mu_hidden=None,
-    gamma_mu_output=None,
-    include_weight_kl: bool = True,
-    weight_kl_scale: float = 1.0,
-    output_weight: float = 1.0,
-) -> jax.Array:
-    """F_DPC at the given (m_zs, v_zs) state, with weights held fixed.
-    `m_zs, v_zs` are tuples of length `net.L_hidden`, one per hidden layer.
-    The shared-KL hidden transition (extension Eq. 12 second sum) sums over
-    l = 0..L_hidden-1.
-    """
-    dtype = m_zs[0].dtype
-    # Hidden transitions: inclusion-KL form (extension Eq. 12 second sum).
-    hidden_term = _trans_dpc_sum(net, x, m_zs, v_zs)
-    # Output boundary term: Gaussian inclusion-KL or categorical softmax NLL
-    # (continuation Eq. 2/48). Operates on the *top* latent only
-    # (continuation Eq. 38).
-    F_out = _output_term(net, y_mean, y_var, y_idx, m_zs[-1], v_zs[-1], key, mc_samples_train)
-
-    output_weight_arr = jnp.asarray(output_weight, dtype=dtype)
-    total = output_weight_arr * F_out + hidden_term
-    if include_weight_kl:
-        total = total + _weight_kl_total(
-            net, gamma_hidden, gamma_output,
-            weight_kl_scale=weight_kl_scale,
-            gamma_mu_hidden=gamma_mu_hidden,
-            gamma_mu_output=gamma_mu_output,
+def output_energy(
+    network: Network,
+    latents: LatentState,
+    targets: Targets,
+    key,
+    mc_samples: int,
+):
+    if network.output_likelihood == "gaussian":
+        predictive = output_predictive_moments(network, latents)
+        return gaussian_kl(
+            targets.mean,
+            targets.variance,
+            predictive.mean,
+            predictive.variance,
+        ).value.sum(axis=-1).mean()
+    if network.output_likelihood == "categorical":
+        return categorical_output_loss(
+            network.output_layer,
+            network.hidden_activations[-1],
+            network.output_estimator,
+            latents.top_mean,
+            latents.top_variance,
+            targets.class_indices,
+            key,
+            mc_samples,
         )
-    return total
+    raise ValueError(f"unsupported output likelihood: {network.output_likelihood!r}")
+
+
+def latent_free_energy(
+    network: Network,
+    inputs,
+    latents: LatentState,
+    *,
+    targets: Targets | None,
+    key,
+    mc_samples: int,
+    output_loss_weight: float,
+):
+    transition_term = hidden_transition_energy(network, inputs, latents)
+    if targets is None:
+        return transition_term
+    return transition_term + output_loss_weight * output_energy(
+        network, latents, targets, key, mc_samples
+    )
+
+
+def weight_kl_terms(
+    network: Network, update: UpdateConfig, scale: float
+):
+    dtype = network.layers[0].mean.dtype
+    mean_total = jnp.zeros((), dtype=dtype)
+    variance_total = jnp.zeros((), dtype=dtype)
+
+    hidden_mean_scale = (
+        update.hidden_weight_kl_scale
+        if update.hidden_mean_kl_scale is None
+        else update.hidden_mean_kl_scale
+    )
+    output_mean_scale = (
+        update.output_weight_kl_scale
+        if update.output_mean_kl_scale is None
+        else update.output_mean_kl_scale
+    )
+    for layer in network.layers[:-1]:
+        components = gaussian_weight_kl_components(
+            layer.mean, layer.log_variance, layer.prior_std
+        )
+        mean_total = mean_total + hidden_mean_scale * components.mean.sum()
+        variance_total = (
+            variance_total
+            + update.hidden_weight_kl_scale * components.variance.sum()
+        )
+    output = network.output_layer
+    components = gaussian_weight_kl_components(
+        output.mean, output.log_variance, output.prior_std
+    )
+    mean_total = mean_total + output_mean_scale * components.mean.sum()
+    variance_total = (
+        variance_total
+        + update.output_weight_kl_scale * components.variance.sum()
+    )
+    return scale * mean_total, scale * variance_total
+
+
+def full_energy_terms(
+    network: Network,
+    inputs,
+    targets: Targets,
+    latents: LatentState,
+    update: UpdateConfig,
+    *,
+    key,
+    weight_kl_scale: float,
+) -> EnergyTerms:
+    output_term = update.output_loss_weight * output_energy(
+        network,
+        latents,
+        targets,
+        key,
+        update.training_mc_samples,
+    )
+    transition_term = hidden_transition_energy(network, inputs, latents)
+    mean_kl, variance_kl = weight_kl_terms(
+        network, update, weight_kl_scale
+    )
+    return EnergyTerms(
+        output=output_term,
+        transitions=transition_term,
+        weight_mean_kl=mean_kl,
+        weight_variance_kl=variance_kl,
+    )
